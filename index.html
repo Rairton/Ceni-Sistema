@@ -27,6 +27,7 @@
         <button class="nav-link" data-tab="promocoes"><span class="nav-icon">％</span>Promoções</button>
         <button class="nav-link" data-tab="pdv"><span class="nav-icon">▣</span>Ponto de venda</button>
         <button class="nav-link" data-tab="financeiro"><span class="nav-icon">◷</span>Financeiro</button>
+        <button class="nav-link" data-tab="atendentes"><span class="nav-icon">♙</span>Atendentes</button>
       </nav>
       <div class="sidebar-bottom">
         <div class="status-dot" id="connectionDot"></div><span id="connectionStatus">Conectando ao Firebase…</span>
@@ -157,7 +158,7 @@
                 </div>
                 <div class="calculation-row"><span>Subtotal</span><strong id="cartSubtotal">R$ 0,00</strong></div>
                 <div class="calculation-row promo-saving hidden" id="promoSavingRow"><span>Descontos de promoção</span><strong id="promoSaving">− R$ 0,00</strong></div>
-                <div class="manual-discount-fields"><label>Desconto manual / cortesia (R$)<input id="manualDiscount" type="number" min="0" step="0.01" value="0"></label><label>Justificativa do desconto<input id="discountReason" placeholder="Obrigatória quando houver desconto" disabled></label></div>
+                <div class="manual-discount-fields"><label>Desconto manual / cortesia (R$)<input id="manualDiscount" type="number" min="0" step="0.01" value="0"></label><label>Justificativa do desconto<input id="discountReason" placeholder="Obrigatória quando houver desconto" disabled></label><p class="promotion-discount-notice hidden" id="promotionDiscountNotice">Desconto manual indisponível para produtos em promoção</p></div>
                 <div class="calculation-row total-row"><span>Total a pagar</span><strong id="cartTotal">R$ 0,00</strong></div>
                 <label class="payment-label">Forma de pagamento<select id="paymentMethod"><option value="Dinheiro">Dinheiro</option><option value="PIX">PIX direto</option><option value="QR Code/PIX Maquininha">QR Code/PIX Maquininha</option><option value="Débito">Cartão de débito</option><option value="Crédito">Cartão de crédito</option></select></label>
                 <div class="calculation-row fee-preview"><span id="cartFeeLabel">Taxa da maquininha (0%)</span><strong id="cartFee">R$ 0,00</strong></div>
@@ -173,11 +174,11 @@
           <div class="page-heading"><div><p class="eyebrow">CONTROLE FINANCEIRO</p><h1>Financeiro</h1><p class="muted">Visão do mês atual • <span id="financeMonth"></span></p></div></div>
           <div class="metric-grid finance-metrics">
             <article class="metric-card"><div class="metric-top"><span>Faturamento bruto</span><span class="metric-icon green-icon">↗</span></div><strong id="financeGross">R$ 0,00</strong><small>vendas e serviços no mês</small></article>
-            <article class="metric-card"><div class="metric-top"><span>CMV</span><span class="metric-icon blue-icon">▤</span></div><strong id="financeCmv">R$ 0,00</strong><small>custo dos produtos vendidos</small></article>
+            <article class="metric-card"><div class="metric-top"><span>CMV</span><span class="metric-icon blue-icon">▤</span></div><strong id="financeCmv">R$ 0,00</strong><small id="financeCmvCaption">custo dos produtos vendidos</small></article>
             <article class="metric-card"><div class="metric-top"><span>Despesas</span><span class="metric-icon orange-icon">↘</span></div><strong id="financeExpenses">R$ 0,00</strong><small>fixas e imprevistos no mês</small></article>
             <article class="metric-card"><div class="metric-top"><span>Descontos concedidos</span><span class="metric-icon purple-icon">％</span></div><strong id="financeDiscounts">R$ 0,00</strong><small>promoções e descontos manuais</small></article>
             <article class="metric-card"><div class="metric-top"><span>Total Perdido em Taxas (R$)</span><span class="metric-icon orange-icon">％</span></div><strong id="financeFees">R$ 0,00</strong><small id="financeFeesCaption">acumulado neste mês</small></article>
-            <article class="metric-card profit-card"><div class="metric-top"><span>Lucro líquido real</span><span class="metric-icon green-icon">✦</span></div><strong id="financeProfit">R$ 0,00</strong><small>após descontos, taxas, CMV e despesas</small></article>
+            <article class="metric-card profit-card"><div class="metric-top"><span>Lucro líquido real</span><span class="metric-icon green-icon">✦</span></div><strong id="financeProfit">R$ 0,00</strong><small id="financeProfitCaption">após descontos, taxas, CMV e despesas</small></article>
           </div>
           <article class="card fee-settings-card">
             <div class="card-heading"><div><h2>Taxas por forma de pagamento</h2><p>Percentuais descontados pela maquininha; dinheiro e PIX direto não têm taxa.</p></div></div>
@@ -216,11 +217,19 @@
               <label>Método de pagamento<select id="historyPaymentFilter"><option value="">Todos</option><option value="Dinheiro">Dinheiro</option><option value="PIX">PIX</option><option value="QR Code/PIX Maquininha">PIX Maquininha</option><option value="Débito">Débito</option><option value="Crédito">Crédito</option></select></label>
               <input class="search-input history-search" id="historySearch" type="search" placeholder="Buscar venda, item ou atendente...">
             </div>
-            <div class="table-scroll"><table><thead><tr><th>HORA</th><th>ITENS / SERVIÇOS</th><th>ATENDENTE</th><th>FORMA DE PAGAMENTO</th><th>VALOR BRUTO</th><th>TAXA DA MAQUININHA</th><th class="align-right">VALOR LÍQUIDO</th></tr></thead><tbody id="salesHistoryBody"></tbody></table></div>
+            <div class="table-scroll"><table><thead><tr><th>HORA</th><th>ITENS / SERVIÇOS</th><th>ATENDENTE</th><th>FORMA DE PAGAMENTO</th><th>VALOR BRUTO</th><th>DESCONTO / MOTIVO</th><th>TAXA DA MAQUININHA</th><th class="align-right">VALOR LÍQUIDO</th></tr></thead><tbody id="salesHistoryBody"></tbody></table></div>
           </article>
           <article class="card previous-months-card">
             <div class="card-heading"><div><h2>Fechamento de meses anteriores</h2><p>Abra um mês para conferir o resumo e as vendas agrupadas por dia.</p></div></div>
             <div id="previousMonths" class="previous-months-list"></div>
+          </article>
+        </section>
+
+        <section class="tab-panel" id="tab-atendentes">
+          <div class="page-heading"><div><p class="eyebrow">EQUIPE E VENDAS</p><h1>Atendentes</h1><p class="muted">Resumo das vendas e histórico de descontos manuais informados no caixa.</p></div></div>
+          <article class="card table-card attendants-card">
+            <div class="card-heading"><div><h2>Desempenho por atendente</h2><p>Inclui vendas registradas no Admin e no PDV dos funcionários.</p></div></div>
+            <div class="table-scroll"><table><thead><tr><th>ATENDENTE</th><th>TOTAL DE VENDAS</th><th>FATURAMENTO GERADO</th><th>TOTAL DE DESCONTOS MANUAIS</th></tr></thead><tbody id="attendantsBody"></tbody></table></div>
           </article>
         </section>
       </div>

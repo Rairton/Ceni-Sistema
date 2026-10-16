@@ -43,9 +43,13 @@ import {
   const state = {
     products: [], services: [], promotions: [], sales: [], finances: [],
     attendants: DEFAULT_ATTENDANTS.slice(),
-    paymentFees: { debit: 0, credit: 0, machinePix: 0 }
+    paymentFees: { debit: 0, credit: 0, machinePix: 0 },
+    paymentFeeHistory: []
   };
   const historyFilters = { rangeDays: null };
+  const knownBatchCosts = new Map();
+  const archivedBatchCosts = new Set();
+  const saleRepairsInFlight = new Set();
   let cart = [];
   let db = null;
   let cloudReady = false;
@@ -130,22 +134,60 @@ import {
   }
 
   function saleGross(sale) {
-    return Number(sale.valorBruto ?? sale.subtotal ?? sale.total ?? 0);
+    return Number(sale.subtotal ?? sale.valorBruto ?? sale.total ?? 0);
+  }
+
+  function hasNumericField(record, field) {
+    return record[field] !== undefined && record[field] !== null && Number.isFinite(Number(record[field]));
+  }
+
+  function saleManualDiscount(sale) {
+    return Number(sale.manualDiscount ?? sale.descontoManual ?? 0) || 0;
+  }
+
+  function salePromoDiscount(sale) {
+    return Number(sale.promoDiscount ?? sale.descontoPromocional ?? 0) || 0;
+  }
+
+  function saleDiscount(sale) {
+    if (hasNumericField(sale, 'valorDesconto')) return Number(sale.valorDesconto);
+    return saleManualDiscount(sale) + salePromoDiscount(sale);
+  }
+
+  function saleDiscountReason(sale) {
+    return sale.discountReason || sale.motivoDesconto || '';
+  }
+
+  function saleFeeRate(sale) {
+    return hasNumericField(sale, 'taxaAplicada')
+      ? Number(sale.taxaAplicada)
+      : paymentFeeRate(salePayment(sale), sale.date || `${saleDate(sale)}T${saleTime(sale)}`);
   }
 
   function saleFee(sale) {
-    return Number(sale.valorTaxaDescontado ?? sale.feeAmount ?? 0);
+    if (hasNumericField(sale, 'valorTaxaDescontado')) return Number(sale.valorTaxaDescontado);
+    if (hasNumericField(sale, 'feeAmount')) return Number(sale.feeAmount);
+    return roundMoney(saleGross(sale) * saleFeeRate(sale) / 100);
   }
 
   function saleNet(sale) {
-    return Number(sale.valorLiquido ?? (sale.total === undefined ? saleGross(sale) : sale.total - saleFee(sale)));
+    if (hasNumericField(sale, 'valorLiquido')) return Number(sale.valorLiquido);
+    return roundMoney(Math.max(0, saleGross(sale) - saleFee(sale) - saleDiscount(sale)));
   }
 
-  function paymentFeeRate(payment) {
+  function paymentFeeRate(payment, atDate = null) {
     const normalized = normalizedPayment(payment);
-    if (normalized === 'Débito') return Number(state.paymentFees.debit) || 0;
-    if (normalized === 'Crédito') return Number(state.paymentFees.credit) || 0;
-    if (String(payment).toLowerCase().includes('maquininha')) return Number(state.paymentFees.machinePix) || 0;
+    let rates = state.paymentFees;
+    if (atDate && state.paymentFeeHistory.length) {
+      const timestamp = new Date(atDate).getTime();
+      const historical = state.paymentFeeHistory
+        .filter(entry => new Date(entry.effectiveAt).getTime() <= timestamp)
+        .sort((a, b) => String(b.effectiveAt).localeCompare(String(a.effectiveAt)))[0];
+      if (historical) rates = historical;
+    }
+    if (normalized === 'Débito') return Number(rates.debit) || 0;
+    if (normalized === 'Crédito') return Number(rates.credit) || 0;
+    if (String(payment).toLowerCase().includes('maquininha')) return Number(rates.machinePix) || 0;
     return 0;
   }
 
@@ -258,15 +300,253 @@ import {
     return roundMoney(promo.type === 'percent' ? price * Number(promo.value) / 100 : Number(promo.value));
   }
 
-  function applyCollectionSnapshot(name, snapshot) {
+  function rememberBatchCosts(products) {
+    products.forEach(product => productBatches(product).forEach(batch => {
+      knownBatchCosts.set(`${product.id}\u0000${batch.id}`, Number(batch.unitCost));
+    }));
+  }
+
+  function batchCostKey(productId, batchId) {
+    return `${productId}\u0000${batchId}`;
+  }
+
+  function batchCostArchiveRef(productId, batchId) {
+    const archiveId = `lote_${encodeURIComponent(`${productId}_${batchId}`)}`;
+    return doc(db, 'financas', archiveId);
+  }
+
+  function archiveBatchCost(productId, batch) {
+    return {
+      type: 'lot_cost',
+      productId,
+      batchId: batch.id,
+      unitCost: Number(batch.unitCost),
+      expiry: batch.expiry || '',
+      receivedAt: batch.receivedAt || ''
+    };
+  }
+
+  async function archiveProductBatchCosts(products) {
+    const writes = [];
+    products.forEach(product => productBatches(product).forEach(batch => {
+      const key = batchCostKey(product.id, batch.id);
+      if (archivedBatchCosts.has(key)) return;
+      archivedBatchCosts.add(key);
+      writes.push(setDoc(batchCostArchiveRef(product.id, batch.id), archiveBatchCost(product.id, batch))
+        .catch(error => {
+          archivedBatchCosts.delete(key);
+          throw error;
+        }));
+    }));
+    await Promise.all(writes);
+  }
+
+  function recoverSaleCosts(sale) {
+    const sourceItems = Array.isArray(sale.items) ? sale.items : [];
+    let cmv = 0;
+    let serviceCosts = 0;
+    let complete = true;
+    let productsComplete = true;
+    if (!sourceItems.length && saleGross(sale) > 0 && !hasNumericField(sale, 'cmv')) {
+      complete = false;
+      productsComplete = false;
+    }
+    const items = sourceItems.map(item => {
+      if (item.type === 'service') {
+        let serviceCost;
+        if (hasNumericField(item, 'serviceCost')) serviceCost = Number(item.serviceCost);
+        else if (hasNumericField(item, 'unitCost')) serviceCost = Number(item.unitCost) * Number(item.qty || 0);
+        else if (hasNumericField(sale, 'serviceCosts')) return item;
+        else {
+          const service = state.services.find(entry => entry.id === item.id);
+          if (service && hasNumericField(service, 'cost')) serviceCost = Number(service.cost) * Number(item.qty || 0);
+          else complete = false;
+        }
+        if (serviceCost !== undefined) serviceCosts += serviceCost;
+        return { ...item, ...(serviceCost === undefined ? {} : { serviceCost }) };
+      }
+
+      if (item.type !== 'product') return item;
+      if (hasNumericField(sale, 'cmv') && !hasNumericField(item, 'cmv')) return item;
+      let productCost;
+      if (hasNumericField(item, 'cmv')) productCost = Number(item.cmv);
+      else if (Array.isArray(item.lotAllocations) && item.lotAllocations.length) {
+        let allocatedCost = 0;
+        let allocationsComplete = true;
+        for (const allocation of item.lotAllocations) {
+          const unitCost = hasNumericField(allocation, 'unitCost')
+            ? Number(allocation.unitCost)
+            : knownBatchCosts.get(`${item.id}\u0000${allocation.batchId}`);
+          if (unitCost === undefined) {
+            allocationsComplete = false;
+            break;
+          }
+          allocatedCost += unitCost * Number(allocation.qty || 0);
+        }
+        if (allocationsComplete) productCost = allocatedCost;
+        else {
+          complete = false;
+          productsComplete = false;
+        }
+      } else if (hasNumericField(item, 'unitCost')) {
+        productCost = Number(item.unitCost) * Number(item.qty || 0);
+      } else {
+        complete = false;
+        productsComplete = false;
+      }
+
+      if (productCost === undefined) return item;
+      cmv += productCost;
+      return {
+        ...item,
+        unitCost: Number(item.qty) ? productCost / Number(item.qty) : 0,
+        cmv: productCost
+      };
+    });
+
+    if (hasNumericField(sale, 'cmv')) cmv = Number(sale.cmv);
+    if (hasNumericField(sale, 'serviceCosts')) serviceCosts = Number(sale.serviceCosts);
+    if (hasNumericField(sale, 'cmv')) productsComplete = true;
+    return { items, cmv: roundMoney(cmv), serviceCosts: roundMoney(serviceCosts), complete, productsComplete };
+  }
+
+  function saleProfit(sale) {
+    if (sale.cmvDisponivel === false || sale.custosDisponiveis === false) return null;
+    if (hasNumericField(sale, 'lucroLiquido')) return Number(sale.lucroLiquido);
+    const costs = recoverSaleCosts(sale);
+    if (!costs.complete) return null;
+    return roundMoney(saleNet(sale) - costs.cmv - costs.serviceCosts);
+  }
+
+  function scheduleSaleRepairs() {
+    if (!cloudReady || !db) return;
+    state.sales.forEach(sale => {
+      const needsFinancialRepair = !hasNumericField(sale, 'taxaAplicada')
+        || !hasNumericField(sale, 'valorTaxaDescontado')
+        || !hasNumericField(sale, 'valorDesconto')
+        || !hasNumericField(sale, 'valorLiquido')
+        || !hasNumericField(sale, 'valorBruto')
+        || (sale.cmvDisponivel !== false && !hasNumericField(sale, 'cmv'));
+      if (!needsFinancialRepair || saleRepairsInFlight.has(sale.id)) return;
+      saleRepairsInFlight.add(sale.id);
+      repairSaleFinancials(sale).catch(reportCloudError).finally(() => saleRepairsInFlight.delete(sale.id));
+    });
+  }
+
+  async function repairSaleFinancials(sale) {
+    const saleRef = doc(db, 'vendas', sale.id);
+    const linkedFinance = state.finances.find(entry => entry.type === 'sale' && entry.relatedSaleId === sale.id);
+    const financeRef = doc(db, 'financas', linkedFinance ? linkedFinance.id : `sale_${sale.id}`);
+
+    await runTransaction(db, async transaction => {
+      const [saleSnapshot, financeSnapshot] = await Promise.all([
+        transaction.get(saleRef),
+        transaction.get(financeRef)
+      ]);
+      if (!saleSnapshot.exists()) return;
+
+      const current = { ...saleSnapshot.data(), id: sale.id };
+      const valorBruto = roundMoney(saleGross(current));
+      const taxaAplicada = saleFeeRate(current);
+      const valorTaxaDescontado = roundMoney(valorBruto * taxaAplicada / 100);
+      const valorDesconto = roundMoney(saleDiscount(current));
+      const valorLiquido = roundMoney(Math.max(0, valorBruto - valorTaxaDescontado - valorDesconto));
+      const costs = recoverSaleCosts(current);
+      const manualDiscount = saleManualDiscount(current);
+      const promoDiscount = salePromoDiscount(current);
+      const reason = saleDiscountReason(current);
+      const updates = {
+        valorBruto,
+        taxaAplicada,
+        valorTaxaDescontado,
+        valorDesconto,
+        valorLiquido,
+        total: valorLiquido,
+        manualDiscount,
+        descontoManual: manualDiscount,
+        promoDiscount,
+        descontoPromocional: promoDiscount,
+        discountReason: reason,
+        motivoDesconto: reason
+      };
+      if (costs.productsComplete) {
+        updates.items = costs.items;
+        updates.cmv = costs.cmv;
+        updates.cmvDisponivel = true;
+      } else {
+        updates.cmvDisponivel = false;
+      }
+      if (costs.complete) {
+        const lucroBruto = roundMoney(valorBruto - valorDesconto - costs.cmv - costs.serviceCosts);
+        updates.serviceCosts = costs.serviceCosts;
+        updates.lucroBruto = lucroBruto;
+        updates.lucroLiquido = roundMoney(lucroBruto - valorTaxaDescontado);
+        updates.custosDisponiveis = true;
+      } else {
+        updates.custosDisponiveis = false;
+      }
+      transaction.update(saleRef, updates);
+
+      const payment = salePayment(current);
+      transaction.set(financeRef, {
+        ...(financeSnapshot.exists() ? financeSnapshot.data() : {}),
+        type: 'sale',
+        relatedSaleId: sale.id,
+        number: current.number || sale.id,
+        date: current.date || new Date().toISOString(),
+        data: saleDate(current),
+        hora: saleTime(current),
+        amount: valorLiquido,
+        subtotal: valorBruto,
+        total: valorLiquido,
+        valorBruto,
+        taxaAplicada,
+        valorTaxaDescontado,
+        valorDesconto,
+        valorLiquido,
+        formaPagamento: payment,
+        payment,
+        atendente: current.atendente || current.attendant || 'Sem atendente',
+        attendant: current.attendant || current.atendente || 'Sem atendente',
+        manualDiscount,
+        promoDiscount,
+        discountReason: reason,
+        motivoDesconto: reason,
+        ...(costs.productsComplete ? { cmv: costs.cmv } : {}),
+        ...(costs.complete ? {
+          serviceCosts: costs.serviceCosts,
+          lucroBruto: updates.lucroBruto,
+          lucroLiquido: updates.lucroLiquido
+        } : {})
+      }, { merge: true });
+    });
+  }
+
+  async function applyCollectionSnapshot(name, snapshot) {
     const records = snapshot.docs.map(item => ({ ...item.data(), id: item.id }));
-    if (name === 'produtos') state.products = records;
+    if (name === 'produtos') {
+      state.products = records;
+      rememberBatchCosts(records);
+      await archiveProductBatchCosts(records);
+    }
     if (name === 'servicos') state.services = records;
     if (name === 'promocoes') state.promotions = records;
-    if (name === 'vendas') state.sales = records.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+    if (name === 'vendas') {
+      state.sales = records.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+      scheduleSaleRepairs();
+    }
     if (name === 'financas') {
+      records.filter(item => item.type === 'lot_cost').forEach(item => {
+        if (!item.productId || !item.batchId || !hasNumericField(item, 'unitCost')) return;
+        const key = batchCostKey(item.productId, item.batchId);
+        knownBatchCosts.set(key, Number(item.unitCost));
+        archivedBatchCosts.add(key);
+      });
       const attendantConfig = records.find(item => item.id === 'config_atendentes');
       const feeConfig = records.find(item => item.id === 'config_taxas');
+      state.paymentFeeHistory = records
+        .filter(item => item.type === 'payment_fee_history' && typeof item.effectiveAt === 'string')
+        .sort((a, b) => String(a.effectiveAt).localeCompare(String(b.effectiveAt)));
       const attendantNames = attendantConfig && Array.isArray(attendantConfig.attendants)
         ? attendantConfig.attendants.filter(name => typeof name === 'string')
         : [];
@@ -281,7 +561,20 @@ import {
           credit: Number(feeConfig.credit) || 0,
           machinePix: Number(feeConfig.machinePix) || 0
         };
+        const effectiveAt = feeConfig.updatedAt || new Date(0).toISOString();
+        if (!state.paymentFeeHistory.some(entry => entry.effectiveAt === effectiveAt)) {
+          state.paymentFeeHistory.push({ ...state.paymentFees, effectiveAt });
+          state.paymentFeeHistory.sort((a, b) => String(a.effectiveAt).localeCompare(String(b.effectiveAt)));
+        }
+      } else if (state.paymentFeeHistory.length) {
+        const latestFees = state.paymentFeeHistory[state.paymentFeeHistory.length - 1];
+        state.paymentFees = {
+          debit: Number(latestFees.debit) || 0,
+          credit: Number(latestFees.credit) || 0,
+          machinePix: Number(latestFees.machinePix) || 0
+        };
       }
+      scheduleSaleRepairs();
       renderFeeSettings();
       renderFinance();
       renderAttendants();
@@ -292,18 +585,29 @@ import {
   function watchCollection(name) {
     return new Promise((resolve, reject) => {
       let firstSnapshot = true;
-      const unsubscribe = onSnapshot(collection(db, name), snapshot => {
-        applyCollectionSnapshot(name, snapshot);
-        snapshotCount += firstSnapshot ? 1 : 0;
-        if (firstSnapshot) {
-          firstSnapshot = false;
-          resolve();
-        }
-        if (snapshotCount === COLLECTIONS.length) {
-          cloudReady = true;
-          lastCloudError = '';
-          setConnectionStatus('live', 'Firestore sincronizado');
-          renderCart();
+      const unsubscribe = onSnapshot(collection(db, name), async snapshot => {
+        try {
+          await applyCollectionSnapshot(name, snapshot);
+          snapshotCount += firstSnapshot ? 1 : 0;
+          if (firstSnapshot) {
+            firstSnapshot = false;
+            resolve();
+          }
+          if (snapshotCount === COLLECTIONS.length) {
+            cloudReady = true;
+            lastCloudError = '';
+            setConnectionStatus('live', 'Firestore sincronizado');
+            scheduleSaleRepairs();
+            renderCart();
+          }
+        } catch (error) {
+          cloudReady = false;
+          setConnectionStatus('error', 'Erro ao arquivar lotes');
+          reportCloudError(error);
+          if (firstSnapshot) {
+            firstSnapshot = false;
+            reject(error);
+          }
         }
       }, error => {
         setConnectionStatus('error', 'Erro de conexão');
@@ -343,7 +647,7 @@ import {
   function showTab(tab) {
     $$('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `tab-${tab}`));
     $$('.nav-link').forEach(link => link.classList.toggle('active', link.dataset.tab === tab));
-    const titles = { inicio: 'Visão geral', estoque: 'Estoque', servicos: 'Serviços / Lounge', promocoes: 'Promoções', pdv: 'Ponto de venda', financeiro: 'Financeiro' };
+    const titles = { inicio: 'Visão geral', estoque: 'Estoque', servicos: 'Serviços / Lounge', promocoes: 'Promoções', pdv: 'Ponto de venda', financeiro: 'Financeiro', atendentes: 'Atendentes' };
     $('#pageTitle').textContent = titles[tab] || titles.inicio;
     $('#sidebar').classList.remove('open');
     $('#menuToggle').setAttribute('aria-expanded', 'false');
@@ -529,13 +833,14 @@ import {
         throw new Error('Informe uma margem e um preço de venda válidos.');
       }
       const productRef = doc(db, 'produtos', productId);
+      let registeredBatch;
       await runTransaction(db, async transaction => {
         const snapshot = await transaction.get(productRef);
         if (!snapshot.exists()) throw new Error('Este produto não existe mais no estoque.');
         const product = { ...snapshot.data(), id: snapshot.id };
         const batches = productBatches(product);
         const salePrice = pricingMode === 'recalculate' ? manualSalePrice : productPrice(product);
-        batches.push({
+        const newBatch = {
           id: `lote-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
           qty: quantity,
           unitCost,
@@ -543,7 +848,9 @@ import {
           receivedAt: new Date().toISOString(),
           salePriceAtReceipt: salePrice,
           marginAtReceipt: productMarginAtPrice(salePrice, unitCost)
-        });
+        };
+        registeredBatch = newBatch;
+        batches.push(newBatch);
         const totalQty = batches.reduce((sum, batch) => sum + Number(batch.qty), 0);
         const averageCost = weightedBatchCost(batches);
         transaction.update(productRef, {
@@ -554,7 +861,13 @@ import {
           margin: productMarginAtPrice(salePrice, averageCost),
           lastRestockedAt: new Date().toISOString()
         });
-      });
+          transaction.set(batchCostArchiveRef(productId, newBatch.id), archiveBatchCost(productId, newBatch));
+        });
+        if (registeredBatch) {
+          const key = batchCostKey(productId, registeredBatch.id);
+          knownBatchCosts.set(key, registeredBatch.unitCost);
+          archivedBatchCosts.add(key);
+        }
         closeRestockModal();
       }, 'Novo lote registrado no Firestore.');
     } finally {
@@ -634,6 +947,32 @@ import {
     if (state.attendants.includes(selected)) select.value = selected;
     else if (state.attendants.length) select.selectedIndex = 0;
     $('#removeAttendant').disabled = state.attendants.length <= 1;
+    renderAttendantSummary();
+  }
+
+  function renderAttendantSummary() {
+    const grouped = new Map(state.attendants.map(name => [name, []]));
+    state.sales.forEach(sale => {
+      const name = sale.attendant || sale.atendente || 'Sem atendente';
+      if (!grouped.has(name)) grouped.set(name, []);
+      grouped.get(name).push(sale);
+    });
+    const rows = [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0], 'pt-BR'));
+    $('#attendantsBody').innerHTML = rows.length ? rows.map(([name, sales]) => {
+      const revenue = sales.reduce((sum, sale) => sum + saleNet(sale), 0);
+      const manualDiscounts = sales.reduce((sum, sale) => sum + saleManualDiscount(sale), 0);
+      const discountedSales = sales.filter(sale => saleManualDiscount(sale) > 0);
+      const discountRows = discountedSales.map(sale => {
+        const items = (sale.items || []).map(item => `${escapeHtml(item.name || 'Item')} ×${Number(item.qty) || 0}`).join(', ');
+        return `<tr><td>${formatDate(saleDate(sale))}</td><td>${escapeHtml(saleTime(sale))}</td><td>${items || `Venda #${escapeHtml(sale.number || sale.id || '')}`}</td><td>${currency(saleManualDiscount(sale))}</td><td class="discount-reason-cell">${escapeHtml(saleDiscountReason(sale) || 'Sem justificativa informada')}</td></tr>`;
+      }).join('');
+      return `<tr class="attendant-summary-row"><td colspan="4"><details class="attendant-detail">
+        <summary class="attendant-summary"><span><strong>${escapeHtml(name)}</strong><small>Ver ${discountedSales.length} desconto(s) manual(is)</small></span><strong>${sales.length}</strong><strong>${currency(revenue)}</strong><strong>${currency(manualDiscounts)}</strong></summary>
+        <div class="attendant-discount-details"><div class="table-scroll"><table><thead><tr><th>DATA</th><th>HORA</th><th>PRODUTO / VENDA</th><th>DESCONTO</th><th>MOTIVO / JUSTIFICATIVA</th></tr></thead><tbody>
+          ${discountRows || '<tr><td colspan="5" class="empty-row">Este atendente não concedeu descontos manuais.</td></tr>'}
+        </tbody></table></div></div>
+      </details></td></tr>`;
+    }).join('') : '<tr><td colspan="4" class="empty-row">Nenhum atendente ou venda registrado.</td></tr>';
   }
 
   function addToCart(type, id) {
@@ -663,6 +1002,10 @@ import {
     return { name: service.name, price: Number(service.price), cost: Number(service.cost), unitDiscount: 0, subtotal: roundMoney(Number(service.price) * line.qty) };
   }
 
+  function cartHasActivePromotion() {
+    return cart.some(line => line.type === 'product' && getActivePromotion(line.id));
+  }
+
   function getCartTotals() {
     let subtotal = 0;
     let promoDiscount = 0;
@@ -672,13 +1015,20 @@ import {
       subtotal += data.price * line.qty;
       promoDiscount += data.unitDiscount * line.qty;
     });
-    const manualInput = Math.max(0, Number($('#manualDiscount').value) || 0);
+    const manualInput = cartHasActivePromotion() ? 0 : Math.max(0, Number($('#manualDiscount').value) || 0);
     const manualDiscount = Math.min(manualInput, Math.max(0, subtotal - promoDiscount));
     return { subtotal, promoDiscount, manualDiscount, total: Math.max(0, subtotal - promoDiscount - manualDiscount) };
   }
 
   function renderCart() {
     cart = cart.filter(line => cartLineData(line));
+    const promotionBlocksManualDiscount = cartHasActivePromotion();
+    $('#manualDiscount').disabled = promotionBlocksManualDiscount;
+    $('#promotionDiscountNotice').classList.toggle('hidden', !promotionBlocksManualDiscount);
+    if (promotionBlocksManualDiscount) {
+      $('#manualDiscount').value = '0';
+      $('#discountReason').value = '';
+    }
     $('#cartCount').textContent = cart.reduce((total, line) => total + line.qty, 0);
     $('#cartDate').textContent = dateTime();
     $('#cartLines').innerHTML = cart.length ? cart.map(line => {
@@ -696,10 +1046,10 @@ import {
     $('#cartTotal').textContent = currency(totals.total);
     const payment = $('#paymentMethod').value;
     const feeRate = paymentFeeRate(payment);
-    const feeAmount = roundMoney(totals.total * feeRate / 100);
+    const feeAmount = roundMoney(totals.subtotal * feeRate / 100);
     $('#cartFeeLabel').textContent = `Taxa da maquininha (${feeRate.toLocaleString('pt-BR')}%)`;
     $('#cartFee').textContent = `− ${currency(feeAmount)}`;
-    $('#cartNetTotal').textContent = currency(totals.total - feeAmount);
+    $('#cartNetTotal').textContent = currency(Math.max(0, totals.subtotal - totals.promoDiscount - totals.manualDiscount - feeAmount));
     $('#discountReason').disabled = totals.manualDiscount <= 0;
     if (totals.manualDiscount <= 0) $('#discountReason').value = '';
     $('#finishSale').disabled = !cart.length || !cloudReady;
@@ -725,6 +1075,9 @@ import {
     ensureCloud();
     if (!cart.length) throw new Error('Adicione produtos ou serviços antes de finalizar.');
     const totals = getCartTotals();
+    if (cartHasActivePromotion() && totals.manualDiscount > 0) {
+      throw new Error('Desconto manual indisponível para produtos em promoção.');
+    }
     const reason = $('#discountReason').value.trim();
     if (totals.manualDiscount > 0 && !reason) {
       $('#discountReason').focus();
@@ -750,16 +1103,20 @@ import {
     const timestamp = now.toISOString();
     const formaPagamento = $('#paymentMethod').value;
     const taxaAplicada = paymentFeeRate(formaPagamento);
-    const valorBruto = totals.total;
+    const valorBruto = roundMoney(totals.subtotal);
+    const valorDesconto = roundMoney(totals.promoDiscount + totals.manualDiscount);
     const valorTaxaDescontado = roundMoney(valorBruto * taxaAplicada / 100);
-    const valorLiquido = roundMoney(valorBruto - valorTaxaDescontado);
+    const valorLiquido = roundMoney(Math.max(0, valorBruto - valorTaxaDescontado - valorDesconto));
     const saleBase = {
       number: makeNumber(), date: timestamp, data: dateOnly(now),
       hora: now.toLocaleTimeString('pt-BR', { hour12: false }),
       subtotal: totals.subtotal, promoDiscount: totals.promoDiscount,
-      manualDiscount: totals.manualDiscount, discountReason: totals.manualDiscount ? reason : '',
-      total: valorBruto, valorBruto, taxaAplicada, valorTaxaDescontado, valorLiquido,
-      payment: formaPagamento, formaPagamento, attendant, atendente: attendant
+      manualDiscount: totals.manualDiscount, descontoManual: totals.manualDiscount,
+      valorDesconto, discountReason: totals.manualDiscount ? reason : '',
+      motivoDesconto: totals.manualDiscount ? reason : '',
+      total: valorLiquido, valorBruto, taxaAplicada, valorTaxaDescontado, valorLiquido,
+      payment: formaPagamento, formaPagamento, attendant, atendente: attendant,
+      origem: 'admin'
     };
     let committedSale;
 
@@ -788,7 +1145,8 @@ import {
           cmv: productCost,
           serviceCost,
           lotAllocations: allocation ? allocation.allocations : [],
-          _revenueBeforeManual: Number(line.total) || 0
+          _revenueBeforeManual: Number(line.total) || 0,
+          _grossBeforeDiscount: roundMoney(Number(line.unitPrice) * Number(line.qty))
         };
       });
       const discountBase = saleItems.reduce((sum, item) => sum + item._revenueBeforeManual, 0);
@@ -804,9 +1162,9 @@ import {
         const lucroBruto = roundMoney(valorPraticado - item.cmv - item.serviceCost);
         const taxaRateada = lastItem
           ? roundMoney(feeRemaining)
-          : roundMoney(valorBruto > 0 ? valorTaxaDescontado * valorPraticado / valorBruto : 0);
+          : roundMoney(valorBruto > 0 ? valorTaxaDescontado * item._grossBeforeDiscount / valorBruto : 0);
         feeRemaining = roundMoney(feeRemaining - taxaRateada);
-        const { _revenueBeforeManual, ...persistedItem } = item;
+        const { _revenueBeforeManual, _grossBeforeDiscount, ...persistedItem } = item;
         return {
           ...persistedItem,
           manualDiscountAllocated,
@@ -840,9 +1198,10 @@ import {
         type: 'sale', relatedSaleId: saleRef.id, number: committedSale.number,
         date: timestamp, data: committedSale.data, hora: committedSale.hora,
         subtotal: committedSale.subtotal, total: committedSale.total,
-        valorBruto, taxaAplicada, valorTaxaDescontado, valorLiquido,
+        amount: valorLiquido, valorBruto, taxaAplicada, valorTaxaDescontado, valorDesconto, valorLiquido,
         formaPagamento, payment: formaPagamento, atendente: attendant, attendant,
         promoDiscount: committedSale.promoDiscount, manualDiscount: committedSale.manualDiscount,
+        discountReason: committedSale.discountReason, motivoDesconto: committedSale.motivoDesconto,
         cmv: committedSale.cmv, lucroBruto: committedSale.lucroBruto,
         lucroLiquido: committedSale.lucroLiquido, items: committedSale.items
       });
@@ -868,7 +1227,7 @@ import {
     const filtered = state.sales.filter(sale => {
       const saleDay = saleDate(sale);
       const saleDayStart = new Date(`${saleDay}T00:00:00`);
-      const searchable = `${sale.number || ''} ${salePayment(sale)} ${sale.attendant || sale.atendente || ''} ${sale.discountReason || ''} ${(sale.items || []).map(item => item.name).join(' ')}`.toLowerCase();
+      const searchable = `${sale.number || ''} ${salePayment(sale)} ${sale.attendant || sale.atendente || ''} ${saleDiscountReason(sale)} ${(sale.items || []).map(item => item.name).join(' ')}`.toLowerCase();
       if (specificDate && saleDay !== specificDate) return false;
       if (!specificDate && fromDate && saleDayStart < fromDate) return false;
       if (paymentFilter && normalizedPayment(salePayment(sale)) !== paymentFilter) return false;
@@ -877,10 +1236,15 @@ import {
     const rowHtml = sale => {
       const names = (sale.items || []).map(item => `${escapeHtml(item.name)} ×${item.qty}`).join(', ');
       const attendant = sale.attendant || sale.atendente || 'Sem atendente';
-      return `<tr><td><span class="sale-id">${escapeHtml(saleTime(sale))}</span><span class="table-subtext">#${escapeHtml(sale.number || '')} · ${formatDate(saleDate(sale))}</span></td><td><span class="history-items">${names || '—'}</span></td><td>${escapeHtml(attendant)}</td><td><span class="tag">${escapeHtml(salePayment(sale))}</span></td><td>${currency(saleGross(sale))}</td><td>${currency(saleFee(sale))}${Number(sale.taxaAplicada) ? `<span class="table-subtext">${Number(sale.taxaAplicada)}%</span>` : ''}</td><td class="align-right"><strong>${currency(saleNet(sale))}</strong></td></tr>`;
+      const reason = saleDiscountReason(sale);
+      const discountCell = saleDiscount(sale) > 0
+        ? `<strong>${currency(saleDiscount(sale))}</strong>${reason ? `<span class="table-subtext">${escapeHtml(reason)}</span>` : ''}`
+        : '—';
+      return `<tr><td><span class="sale-id">${escapeHtml(saleTime(sale))}</span><span class="table-subtext">#${escapeHtml(sale.number || sale.id || '')} · ${formatDate(saleDate(sale))}</span></td><td><span class="history-items">${names || '—'}</span></td><td>${escapeHtml(attendant)}</td><td><span class="tag">${escapeHtml(salePayment(sale))}</span></td><td>${currency(saleGross(sale))}</td><td class="history-discount-cell">${discountCell}</td><td>${currency(saleFee(sale))}${saleFeeRate(sale) ? `<span class="table-subtext">${saleFeeRate(sale)}%</span>` : ''}</td><td class="align-right"><strong>${currency(saleNet(sale))}</strong></td></tr>`;
     };
-    $('#salesHistoryBody').innerHTML = filtered.length ? filtered.map(rowHtml).join('') : '<tr><td colspan="7" class="empty-row">Nenhuma venda corresponde aos filtros selecionados.</td></tr>';
-    $('#recentSalesBody').innerHTML = state.sales.length ? state.sales.slice(0, 5).map(sale => `<tr><td><span class="sale-id">#${escapeHtml(sale.number || '')}</span><span class="table-subtext">${escapeHtml(sale.attendant || sale.atendente || '')}</span></td><td>${dateTime(sale.date)}</td><td>${(sale.items || []).reduce((sum, item) => sum + Number(item.qty), 0)} item(ns)</td><td><span class="tag">${escapeHtml(salePayment(sale))}</span></td><td class="align-right"><strong>${currency(saleNet(sale))}</strong></td></tr>`).join('') : '<tr><td colspan="5" class="empty-row">As vendas aparecerão aqui após a primeira venda.</td></tr>';
+    $('#salesHistoryBody').innerHTML = filtered.length ? filtered.map(rowHtml).join('') : '<tr><td colspan="8" class="empty-row">Nenhuma venda corresponde aos filtros selecionados.</td></tr>';
+    $('#recentSalesBody').innerHTML = state.sales.length ? state.sales.slice(0, 5).map(sale => `<tr><td><span class="sale-id">#${escapeHtml(sale.number || sale.id || '')}</span><span class="table-subtext">${escapeHtml(sale.attendant || sale.atendente || '')}</span></td><td>${dateTime(sale.date)}</td><td>${(sale.items || []).reduce((sum, item) => sum + Number(item.qty), 0)} item(ns)</td><td><span class="tag">${escapeHtml(salePayment(sale))}</span></td><td class="align-right"><strong>${currency(saleNet(sale))}</strong></td></tr>`).join('') : '<tr><td colspan="5" class="empty-row">As vendas aparecerão aqui após a primeira venda.</td></tr>';
+    renderAttendantSummary();
   }
 
   function renderPreviousMonths() {
@@ -892,17 +1256,18 @@ import {
     $('#previousMonths').innerHTML = previousKeys.length ? previousKeys.map(key => {
       const monthSales = state.sales.filter(sale => monthKey(`${saleDate(sale)}T12:00:00`) === key);
       const monthExpenses = state.finances.filter(entry => entry.type === 'expense' && monthKey(`${entry.date}T12:00:00`) === key);
-      const gross = monthSales.reduce((sum, sale) => sum + Number(sale.subtotal === undefined ? saleGross(sale) : sale.subtotal), 0);
+      const gross = monthSales.reduce((sum, sale) => sum + saleGross(sale), 0);
       const fees = monthSales.reduce((sum, sale) => sum + saleFee(sale), 0);
-      const cmv = monthSales.reduce((sum, sale) => sum + Number(sale.cmv || (sale.items || []).filter(item => item.type === 'product').reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0)), 0);
-      const discounts = monthSales.reduce((sum, sale) => sum + Number(sale.promoDiscount || 0) + Number(sale.manualDiscount || 0), 0);
+      const monthCosts = monthSales.map(recoverSaleCosts);
+      const cmvUnavailable = monthCosts.some(cost => !cost.productsComplete);
+      const cmv = monthCosts.reduce((sum, cost) => sum + cost.cmv, 0);
+      const discounts = monthSales.reduce((sum, sale) => sum + saleDiscount(sale), 0);
       const expenses = monthExpenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
-      const serviceCosts = monthSales.reduce((sum, sale) => sum + (sale.items || []).filter(item => item.type === 'service').reduce((subtotal, item) => subtotal + Number(item.unitCost || 0) * Number(item.qty || 0), 0), 0);
+      const monthProfits = monthSales.map(saleProfit);
+      const missingCosts = monthProfits.some(value => value === null);
       const profitFromSales = monthSales.reduce((sum, sale) => {
-        if (Number.isFinite(Number(sale.lucroLiquido))) return sum + Number(sale.lucroLiquido);
-        return sum + saleNet(sale) - Number(sale.cmv || 0)
-          - (sale.items || []).filter(item => item.type === 'service')
-            .reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0);
+        const profit = saleProfit(sale);
+        return profit === null ? sum : sum + profit;
       }, 0);
       const profit = profitFromSales - expenses;
       const days = new Set([...monthSales.map(sale => saleDate(sale)), ...monthExpenses.map(expense => expense.date)]).size;
@@ -911,9 +1276,9 @@ import {
         <span class="month-title"><strong>${new Date(`${key}-01T12:00:00`).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' })}</strong><small>${monthSales.length} venda(s) · ${days} dia(s) movimentado(s)</small></span>
         <span class="month-summary-item"><small>Faturamento Bruto</small><strong>${currency(gross)}</strong></span>
         <span class="month-summary-item"><small>Total em Taxas</small><strong>${currency(fees)}</strong></span>
-        <span class="month-summary-item"><small>CMV</small><strong>${currency(cmv)}</strong></span>
+        <span class="month-summary-item"><small>CMV</small><strong>${cmvUnavailable ? 'Indisponível' : currency(cmv)}</strong></span>
         <span class="month-summary-item"><small>Despesas</small><strong>${currency(expenses)}</strong></span>
-        <span class="month-summary-item month-profit"><small>Lucro Líquido Real</small><strong>${currency(profit)}</strong></span>
+        <span class="month-summary-item month-profit"><small>Lucro Líquido Real</small><strong>${missingCosts ? 'CMV indisponível' : currency(profit)}</strong></span>
       </summary>
       <div class="month-days">${dayKeys.map(day => {
         const daySales = monthSales.filter(sale => saleDate(sale) === day);
@@ -922,10 +1287,10 @@ import {
         const dayFees = daySales.reduce((sum, sale) => sum + saleFee(sale), 0);
         const dayNet = daySales.reduce((sum, sale) => sum + saleNet(sale), 0);
         return `<details class="day-detail"><summary><strong>${formatDate(day)}</strong><span>${daySales.length} venda(s)</span><span>Bruto ${currency(dayGross)}</span><span>Taxas ${currency(dayFees)}</span><span>Líquido ${currency(dayNet)}</span></summary>
-          <div class="table-scroll"><table><thead><tr><th>HORA</th><th>VENDA / DESPESA</th><th>ATENDENTE / CATEGORIA</th><th>FORMA DE PAGAMENTO</th><th>BRUTO</th><th>TAXA / DESPESA</th><th>LÍQUIDO</th></tr></thead><tbody>
-          ${daySales.map(sale => `<tr><td>${escapeHtml(saleTime(sale))}</td><td>#${escapeHtml(sale.number || '')} · ${escapeHtml((sale.items || []).map(item => item.name).join(', '))}</td><td>${escapeHtml(sale.attendant || sale.atendente || '—')}</td><td>${escapeHtml(salePayment(sale))}</td><td>${currency(saleGross(sale))}</td><td>${currency(saleFee(sale))}</td><td>${currency(saleNet(sale))}</td></tr>`).join('')}
-          ${dayExpenses.map(expense => `<tr><td>—</td><td>${escapeHtml(expense.description)}</td><td>${escapeHtml(expense.category)}</td><td>Despesa</td><td>—</td><td>− ${currency(expense.amount)}</td><td>—</td></tr>`).join('')}
-          ${daySales.length || dayExpenses.length ? '' : '<tr><td colspan="7" class="empty-row">Sem movimentações neste dia.</td></tr>'}
+          <div class="table-scroll"><table><thead><tr><th>HORA</th><th>VENDA / DESPESA</th><th>ATENDENTE / CATEGORIA</th><th>FORMA DE PAGAMENTO</th><th>BRUTO</th><th>DESCONTO / MOTIVO</th><th>TAXA / DESPESA</th><th>LÍQUIDO</th></tr></thead><tbody>
+          ${daySales.map(sale => `<tr><td>${escapeHtml(saleTime(sale))}</td><td>#${escapeHtml(sale.number || sale.id || '')} · ${escapeHtml((sale.items || []).map(item => item.name).join(', '))}</td><td>${escapeHtml(sale.attendant || sale.atendente || '—')}</td><td>${escapeHtml(salePayment(sale))}</td><td>${currency(saleGross(sale))}</td><td>${saleDiscount(sale) ? `${currency(saleDiscount(sale))}${saleDiscountReason(sale) ? `<span class="table-subtext">${escapeHtml(saleDiscountReason(sale))}</span>` : ''}` : '—'}</td><td>${currency(saleFee(sale))}</td><td>${currency(saleNet(sale))}</td></tr>`).join('')}
+          ${dayExpenses.map(expense => `<tr><td>—</td><td>${escapeHtml(expense.description)}</td><td>${escapeHtml(expense.category)}</td><td>Despesa</td><td>—</td><td>—</td><td>− ${currency(expense.amount)}</td><td>—</td></tr>`).join('')}
+          ${daySales.length || dayExpenses.length ? '' : '<tr><td colspan="8" class="empty-row">Sem movimentações neste dia.</td></tr>'}
           </tbody></table></div></details>`;
       }).join('')}</div></details>`;
     }).join('') : '<div class="cart-empty">Os fechamentos dos meses anteriores aparecerão aqui.</div>';
@@ -947,33 +1312,37 @@ import {
   function renderFinance() {
     const monthSales = state.sales.filter(sale => isCurrentMonth(saleDate(sale)));
     const monthExpenses = state.finances.filter(entry => entry.type === 'expense' && isCurrentMonth(entry.date));
-    const gross = monthSales.reduce((sum, sale) => sum + Number(sale.subtotal === undefined ? sale.total || 0 : sale.subtotal), 0);
-    const cmv = monthSales.reduce((sum, sale) => sum + Number(sale.cmv || 0), 0);
+    const gross = monthSales.reduce((sum, sale) => sum + saleGross(sale), 0);
+    const monthCosts = monthSales.map(recoverSaleCosts);
+    const cmvUnavailable = monthCosts.some(cost => !cost.productsComplete);
+    const cmv = monthCosts.reduce((sum, cost) => sum + cost.cmv, 0);
     const expenses = monthExpenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
-    const discounts = monthSales.reduce((sum, sale) => sum + Number(sale.promoDiscount || 0) + Number(sale.manualDiscount || 0), 0);
+    const discounts = monthSales.reduce((sum, sale) => sum + saleDiscount(sale), 0);
     const monthFees = monthSales.reduce((sum, sale) => sum + saleFee(sale), 0);
     const totalFees = state.sales.reduce((sum, sale) => sum + saleFee(sale), 0);
-    const serviceCosts = monthSales.reduce((sum, sale) => sum + (sale.items || []).filter(item => item.type === 'service').reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0), 0);
     $('#financeGross').textContent = currency(gross);
-    $('#financeCmv').textContent = currency(cmv);
+    $('#financeCmv').textContent = cmvUnavailable ? '—' : currency(cmv);
+    $('#financeCmvCaption').textContent = cmvUnavailable
+      ? 'há venda(s) sem custo de lote recuperável'
+      : 'custo dos produtos vendidos';
     $('#financeExpenses').textContent = currency(expenses);
     $('#financeDiscounts').textContent = currency(discounts);
     $('#financeFees').textContent = currency(totalFees);
     $('#financeFeesCaption').textContent = `acumulado em todo o histórico · ${currency(monthFees)} neste mês`;
-    const profitFromSales = monthSales.reduce((sum, sale) => {
-      if (Number.isFinite(Number(sale.lucroLiquido))) return sum + Number(sale.lucroLiquido);
-      return sum + saleNet(sale) - Number(sale.cmv || 0)
-        - (sale.items || []).filter(item => item.type === 'service')
-          .reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0);
-    }, 0);
-    $('#financeProfit').textContent = currency(profitFromSales - expenses);
+    const monthProfits = monthSales.map(saleProfit);
+    const hasMissingCost = monthProfits.some(value => value === null);
+    const profitFromSales = monthProfits.reduce((sum, value) => sum + (value === null ? 0 : value), 0);
+    $('#financeProfit').textContent = hasMissingCost ? '—' : currency(profitFromSales - expenses);
+    $('#financeProfitCaption').textContent = hasMissingCost
+      ? `${monthProfits.filter(value => value === null).length} venda(s) sem custos recuperáveis; resultado indisponível`
+      : 'após descontos, taxas, CMV e despesas';
     $('#financeMonth').textContent = new Date().toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
     $('#expensesList').innerHTML = monthExpenses.length ? monthExpenses.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map(expense => `<div class="expense-entry"><span><strong>${escapeHtml(expense.description)}</strong><small>${escapeHtml(expense.category)} · ${formatDate(expense.date)}</small></span><span class="expense-value">− ${currency(expense.amount)}</span></div>`).join('') : '<div class="cart-empty">Nenhuma despesa registrada neste mês.</div>';
     const todaySales = state.sales.filter(sale => saleDate(sale) === dateOnly(new Date()));
-    const todayAmount = todaySales.reduce((sum, sale) => sum + Number(sale.total || 0), 0);
+    const todayAmount = todaySales.reduce((sum, sale) => sum + saleNet(sale), 0);
     $('#todayRevenue').textContent = currency(todayAmount);
     $('#todaySalesCount').textContent = `${todaySales.length} venda${todaySales.length === 1 ? '' : 's'} realizada${todaySales.length === 1 ? '' : 's'}`;
-    $('#monthRevenue').textContent = currency(monthSales.reduce((sum, sale) => sum + Number(sale.total || 0), 0));
+    $('#monthRevenue').textContent = currency(monthSales.reduce((sum, sale) => sum + saleNet(sale), 0));
     $('#monthSalesCount').textContent = `${monthSales.length} venda${monthSales.length === 1 ? '' : 's'} realizada${monthSales.length === 1 ? '' : 's'}`;
     renderPreviousMonths();
   }
@@ -1060,7 +1429,7 @@ import {
           salePriceAtReceipt: salePrice,
           marginAtReceipt: margin
         }] : [];
-        await setDoc(productRef, {
+        const newProduct = {
           ...productFields,
           qty,
           cost,
@@ -1069,7 +1438,18 @@ import {
           expiry,
           batches: initialBatch,
           createdAt: new Date().toISOString()
+        };
+        await runTransaction(db, async transaction => {
+          transaction.set(productRef, newProduct);
+          if (initialBatch.length) {
+            transaction.set(batchCostArchiveRef(productRef.id, initialBatch[0].id), archiveBatchCost(productRef.id, initialBatch[0]));
+          }
         });
+        if (initialBatch.length) {
+          const key = batchCostKey(productRef.id, initialBatch[0].id);
+          knownBatchCosts.set(key, cost);
+          archivedBatchCosts.add(key);
+        }
       }
       resetProductForm();
     }, $('#productId').value ? 'Produto atualizado na nuvem.' : 'Produto cadastrado na nuvem.');
@@ -1240,10 +1620,22 @@ import {
       if (Object.values(paymentFees).some(value => !Number.isFinite(value) || value < 0 || value > 100)) {
         throw new Error('Informe taxas entre 0% e 100%.');
       }
-      await setDoc(doc(db, 'financas', 'config_taxas'), {
-        type: 'config', ...paymentFees, updatedAt: new Date().toISOString()
-      }, { merge: true });
+      const effectiveAt = new Date().toISOString();
+      const feeHistoryRef = doc(db, 'financas', `taxas_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+      await runTransaction(db, async transaction => {
+        transaction.set(doc(db, 'financas', 'config_taxas'), {
+          type: 'config', ...paymentFees, updatedAt: effectiveAt
+        }, { merge: true });
+        transaction.set(feeHistoryRef, {
+          type: 'payment_fee_history',
+          ...paymentFees,
+          effectiveAt,
+          updatedAt: effectiveAt
+        });
+      });
       state.paymentFees = paymentFees;
+      state.paymentFeeHistory.push({ ...paymentFees, effectiveAt });
+      state.paymentFeeHistory.sort((a, b) => String(a.effectiveAt).localeCompare(String(b.effectiveAt)));
       renderCart();
     }, 'Taxas salvas e sincronizadas com os outros caixas.');
   });

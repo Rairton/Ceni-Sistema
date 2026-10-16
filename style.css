@@ -135,3 +135,26 @@ input,select,textarea{width:100%;min-height:37px;background:#151817;color:#e6ebe
 .margin-estimates .new-blended-margin strong{color:var(--green-strong)}
 #confirmRestock:disabled{opacity:.55;cursor:wait}
 @media(max-width:560px){.restock-modal{padding:22px 15px}.restock-price-context{grid-template-columns:1fr 1fr}.restock-price-context div:first-child{grid-column:1/-1}.restock-input-grid{grid-template-columns:1fr 1fr}.restock-input-grid label:last-child{grid-column:1/-1}.margin-estimates{grid-template-columns:1fr 1fr}.restock-modal .form-actions{position:sticky;bottom:-1px;background:#1b1f1c;padding:9px 0 0}}
+
+.promotion-discount-notice{grid-column:1/-1;margin:0;padding:8px 10px;border:1px solid #654b22;border-radius:7px;background:#292215;color:#f1cc76;font-size:10px;line-height:1.45}
+.manual-discount-fields input:disabled{border-color:#413b2c;background:#1d1b16;color:#7f7a6b}
+.attendants-card{padding-bottom:7px}
+.attendant-summary-row>td{padding:8px 5px}
+.attendant-detail{border:1px solid #303632;border-radius:9px;background:#171a18;overflow:hidden}
+.attendant-detail>summary{list-style:none;display:grid;grid-template-columns:minmax(150px,1.3fr) minmax(90px,.65fr) minmax(130px,1fr) minmax(150px,1fr);align-items:center;gap:12px;padding:13px 14px;cursor:pointer}
+.attendant-detail>summary::-webkit-details-marker{display:none}
+.attendant-detail>summary:hover{background:#1e2420}
+.attendant-summary>span:first-child strong,.attendant-summary>span:first-child small{display:block}
+.attendant-summary>span:first-child strong{color:#e7eee9;font-size:11px}
+.attendant-summary>span:first-child small{margin-top:3px;color:#77817b;font-size:9px}
+.attendant-summary>strong{color:#dce4de;font-size:10px}
+.attendant-summary>strong:last-child{color:#74dfaa}
+.attendant-discount-details{padding:2px 12px 9px;border-top:1px solid #303632}
+.attendant-discount-details table{min-width:650px}
+.attendant-discount-details tbody td{font-size:9px}
+.discount-reason-cell{max-width:240px;white-space:normal}
+.history-discount-cell{min-width:145px;max-width:230px;white-space:normal}
+.history-discount-cell .table-subtext{line-height:1.45}
+#financeProfitCaption{line-height:1.45}
+@media(max-width:800px){.attendant-detail>summary{grid-template-columns:minmax(125px,1fr) repeat(3,minmax(90px,.8fr));gap:8px;padding:11px}.attendant-detail>summary>strong{font-size:9px}}
+@media(max-width:560px){.attendant-detail>summary{grid-template-columns:1fr 1fr}.attendant-detail>summary>span:first-child{grid-column:1/-1}.attendant-summary>strong{padding:2px 0}.attendant-discount-details{padding-right:7px;padding-left:7px}}
