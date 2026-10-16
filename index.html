@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#121212">
   <meta name="description" content="Painel de gestão da Ceni Distribuidora, Tabacaria & Conveniência.">
   <title>Ceni | Gestão da loja</title>
+    <link rel="icon" href="Logo.png">
   <link rel="stylesheet" href="style.css">
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js">
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js">
@@ -82,6 +83,7 @@
                   <label>Setor<select id="productSector" required><option value="">Selecione</option><option>Distribuidora</option><option>Tabacaria</option><option>Conveniência</option></select></label>
                   <label class="full-field">Etiqueta<select id="productTag" required disabled><option value="">Selecione primeiro o setor</option></select></label>
                 </div>
+                <p class="inventory-edit-hint hidden" id="productInventoryHint">Estoque e custo dos lotes são controlados pelo botão “Reabastecer / + Lote” na tabela.</p>
                 <div class="form-actions"><button type="button" class="button button-quiet hidden" id="cancelProductEdit">Cancelar</button><button class="button button-primary" type="submit" id="saveProductButton">Salvar produto</button></div>
               </form>
             </article>
@@ -157,7 +159,9 @@
                 <div class="calculation-row promo-saving hidden" id="promoSavingRow"><span>Descontos de promoção</span><strong id="promoSaving">− R$ 0,00</strong></div>
                 <div class="manual-discount-fields"><label>Desconto manual / cortesia (R$)<input id="manualDiscount" type="number" min="0" step="0.01" value="0"></label><label>Justificativa do desconto<input id="discountReason" placeholder="Obrigatória quando houver desconto" disabled></label></div>
                 <div class="calculation-row total-row"><span>Total a pagar</span><strong id="cartTotal">R$ 0,00</strong></div>
-                <label class="payment-label">Forma de pagamento<select id="paymentMethod"><option>Pix</option><option>Dinheiro</option><option>Cartão de débito</option><option>Cartão de crédito</option><option>Outro</option></select></label>
+                <label class="payment-label">Forma de pagamento<select id="paymentMethod"><option value="Dinheiro">Dinheiro</option><option value="PIX">PIX direto</option><option value="QR Code/PIX Maquininha">QR Code/PIX Maquininha</option><option value="Débito">Cartão de débito</option><option value="Crédito">Cartão de crédito</option></select></label>
+                <div class="calculation-row fee-preview"><span id="cartFeeLabel">Taxa da maquininha (0%)</span><strong id="cartFee">R$ 0,00</strong></div>
+                <div class="calculation-row net-preview"><span>Líquido após taxa</span><strong id="cartNetTotal">R$ 0,00</strong></div>
                 <button class="button button-primary finish-sale" id="finishSale" type="button">Finalizar venda <span>→</span></button>
                 <p class="secure-note">✓ Venda registrada no histórico e no caixa</p>
               </div>
@@ -172,8 +176,21 @@
             <article class="metric-card"><div class="metric-top"><span>CMV</span><span class="metric-icon blue-icon">▤</span></div><strong id="financeCmv">R$ 0,00</strong><small>custo dos produtos vendidos</small></article>
             <article class="metric-card"><div class="metric-top"><span>Despesas</span><span class="metric-icon orange-icon">↘</span></div><strong id="financeExpenses">R$ 0,00</strong><small>fixas e imprevistos no mês</small></article>
             <article class="metric-card"><div class="metric-top"><span>Descontos concedidos</span><span class="metric-icon purple-icon">％</span></div><strong id="financeDiscounts">R$ 0,00</strong><small>promoções e descontos manuais</small></article>
-            <article class="metric-card profit-card"><div class="metric-top"><span>Lucro líquido real</span><span class="metric-icon green-icon">✦</span></div><strong id="financeProfit">R$ 0,00</strong><small>faturamento − CMV − despesas</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Total Perdido em Taxas (R$)</span><span class="metric-icon orange-icon">％</span></div><strong id="financeFees">R$ 0,00</strong><small id="financeFeesCaption">acumulado neste mês</small></article>
+            <article class="metric-card profit-card"><div class="metric-top"><span>Lucro líquido real</span><span class="metric-icon green-icon">✦</span></div><strong id="financeProfit">R$ 0,00</strong><small>após descontos, taxas, CMV e despesas</small></article>
           </div>
+          <article class="card fee-settings-card">
+            <div class="card-heading"><div><h2>Taxas por forma de pagamento</h2><p>Percentuais descontados pela maquininha; dinheiro e PIX direto não têm taxa.</p></div></div>
+            <form id="feeSettingsForm">
+              <div class="fee-settings-grid">
+                <label>Débito (%)<input id="feeDebit" type="number" min="0" max="100" step="0.01" value="0"></label>
+                <label>Crédito (%)<input id="feeCredit" type="number" min="0" max="100" step="0.01" value="0"></label>
+                <label>QR Code / PIX Maquininha (%)<input id="feeMachinePix" type="number" min="0" max="100" step="0.01" value="0"></label>
+                <div class="fee-zero-note"><span>Dinheiro</span><strong>0%</strong><span>PIX direto</span><strong>0%</strong></div>
+                <button class="button button-primary" type="submit" id="saveFeesButton">Salvar taxas</button>
+              </div>
+            </form>
+          </article>
           <div class="finance-layout">
             <article class="card form-card expense-card">
               <div class="card-heading"><div><h2>Lançar despesa</h2><p>Registre custos fixos ou imprevistos.</p></div></div>
@@ -188,8 +205,22 @@
             <article class="card expense-list-card"><div class="card-heading"><div><h2>Despesas do mês</h2><p>Últimos lançamentos</p></div></div><div id="expensesList" class="expense-list"></div></article>
           </div>
           <article class="card table-card history-card">
-            <div class="card-heading wrap-heading"><div><h2>Histórico de vendas</h2><p>Vendas e serviços finalizados no caixa.</p></div><div class="table-tools"><input class="search-input" id="historySearch" type="search" placeholder="Buscar na venda..."></div></div>
-            <div class="table-scroll"><table><thead><tr><th>VENDA</th><th>DATA / HORA</th><th>ITENS / SERVIÇOS</th><th>PAGAMENTO</th><th>DESCONTOS</th><th class="align-right">TOTAL</th></tr></thead><tbody id="salesHistoryBody"></tbody></table></div>
+            <div class="card-heading wrap-heading"><div><h2>Histórico de vendas</h2><p>Filtre vendas por período e forma de pagamento.</p></div></div>
+            <div class="history-filters">
+              <div class="quick-filters" role="group" aria-label="Filtros rápidos">
+                <button type="button" class="filter-chip active" data-history-range="all">Todas</button>
+                <button type="button" class="filter-chip" data-history-range="7">Últimos 7 Dias</button>
+                <button type="button" class="filter-chip" data-history-range="30">Último Mês</button>
+              </div>
+              <label>Data específica<input id="historyDateFilter" type="date"></label>
+              <label>Método de pagamento<select id="historyPaymentFilter"><option value="">Todos</option><option value="Dinheiro">Dinheiro</option><option value="PIX">PIX</option><option value="QR Code/PIX Maquininha">PIX Maquininha</option><option value="Débito">Débito</option><option value="Crédito">Crédito</option></select></label>
+              <input class="search-input history-search" id="historySearch" type="search" placeholder="Buscar venda, item ou atendente...">
+            </div>
+            <div class="table-scroll"><table><thead><tr><th>HORA</th><th>ITENS / SERVIÇOS</th><th>ATENDENTE</th><th>FORMA DE PAGAMENTO</th><th>VALOR BRUTO</th><th>TAXA DA MAQUININHA</th><th class="align-right">VALOR LÍQUIDO</th></tr></thead><tbody id="salesHistoryBody"></tbody></table></div>
+          </article>
+          <article class="card previous-months-card">
+            <div class="card-heading"><div><h2>Fechamento de meses anteriores</h2><p>Abra um mês para conferir o resumo e as vendas agrupadas por dia.</p></div></div>
+            <div id="previousMonths" class="previous-months-list"></div>
           </article>
         </section>
       </div>
@@ -198,6 +229,48 @@
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
   <div class="modal-backdrop hidden" id="saleModal" role="dialog" aria-modal="true" aria-labelledby="saleModalTitle">
     <div class="modal-card"><div class="success-mark">✓</div><p class="eyebrow">VENDA CONCLUÍDA</p><h2 id="saleModalTitle">Venda registrada!</h2><p id="saleModalMessage"></p><button class="button button-primary" id="closeSaleModal">Continuar</button></div>
+  </div>
+  <div class="modal-backdrop hidden" id="restockModal" role="dialog" aria-modal="true" aria-labelledby="restockModalTitle">
+    <div class="modal-card restock-modal">
+      <button type="button" class="modal-close" id="closeRestockModal" aria-label="Fechar">×</button>
+      <p class="eyebrow">ENTRADA DE ESTOQUE</p>
+      <h2 id="restockModalTitle">Reabastecer produto</h2>
+      <p class="restock-product-name" id="restockProductName"></p>
+      <div class="restock-price-context">
+        <div><span>Preço de venda atual</span><strong id="restockCurrentPrice">R$ 0,00</strong></div>
+        <div><span>Custo antigo médio</span><strong id="restockOldCost">R$ 0,00</strong></div>
+        <div><span>Custo deste lote</span><strong id="restockNewCostPreview">R$ 0,00</strong></div>
+      </div>
+      <form id="restockForm">
+        <input type="hidden" id="restockProductId">
+        <div class="restock-input-grid">
+          <label>Quantidade recebida<input id="restockQty" type="number" min="1" step="1" required placeholder="0"></label>
+          <label>Custo unitário do novo lote (R$)<input id="restockUnitCost" type="number" min="0" step="0.01" required placeholder="0,00"></label>
+          <label>Validade deste lote<input id="restockExpiry" type="date"></label>
+        </div>
+        <fieldset class="pricing-options">
+          <legend>Como deseja precificar?</legend>
+          <label class="pricing-choice">
+            <input type="radio" name="restockPricing" value="keep" checked>
+            <span><strong id="keepPriceLabel">Manter Preço de Venda Atual (R$ 0,00)</strong><small>O preço do PDV permanece igual; o novo lote guarda seu custo e sua margem real.</small></span>
+          </label>
+          <label class="pricing-choice">
+            <input type="radio" name="restockPricing" value="recalculate">
+            <span><strong>Recalcular Preço de Venda</strong><small>Defina a margem sobre o custo deste lote. O preço sugerido pode ser ajustado manualmente.</small></span>
+          </label>
+          <div class="restock-reprice-fields hidden" id="restockRepriceFields">
+            <label>Margem desejada (%)<input id="restockMargin" type="number" min="0" step="0.1" value="30"></label>
+            <label>Preço de venda final (R$)<input id="restockSalePrice" type="number" min="0" step="0.01" required></label>
+          </div>
+        </fieldset>
+        <div class="margin-estimates">
+          <div><span>Margem no novo lote · preço atual</span><strong id="keepMarginEstimate">0%</strong></div>
+          <div><span>Margem com nova precificação</span><strong id="newMarginEstimate">0%</strong></div>
+          <div class="new-blended-margin"><span>Margem estimada média após entrada</span><strong id="blendedMarginEstimate">0%</strong></div>
+        </div>
+        <div class="form-actions"><button type="button" class="button button-quiet" id="cancelRestock">Cancelar</button><button class="button button-primary" type="submit" id="confirmRestock">Registrar lote</button></div>
+      </form>
+    </div>
   </div>
 </body>
 </html>

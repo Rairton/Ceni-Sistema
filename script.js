@@ -40,7 +40,12 @@ import {
   const escapeHtml = value => String(value === null || value === undefined ? '' : value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
   const makeNumber = () => String(Date.now()).slice(-6);
 
-  const state = { products: [], services: [], promotions: [], sales: [], finances: [], attendants: DEFAULT_ATTENDANTS.slice() };
+  const state = {
+    products: [], services: [], promotions: [], sales: [], finances: [],
+    attendants: DEFAULT_ATTENDANTS.slice(),
+    paymentFees: { debit: 0, credit: 0, machinePix: 0 }
+  };
+  const historyFilters = { rangeDays: null };
   let cart = [];
   let db = null;
   let cloudReady = false;
@@ -100,8 +105,58 @@ import {
     return Number.isNaN(value.getTime()) ? '—' : value.toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
   }
 
+  function saleDate(sale) {
+    if (typeof sale.data === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(sale.data)) return sale.data;
+    return dateOnly(sale.date || new Date());
+  }
+
+  function saleTime(sale) {
+    if (typeof sale.hora === 'string' && /^\d{2}:\d{2}:\d{2}$/.test(sale.hora)) return sale.hora;
+    const date = new Date(sale.date);
+    return Number.isNaN(date.getTime()) ? '—' : date.toLocaleTimeString('pt-BR', { hour12: false });
+  }
+
+  function salePayment(sale) {
+    return sale.formaPagamento || sale.payment || '—';
+  }
+
+  function normalizedPayment(value) {
+    const payment = String(value || '').toLowerCase();
+    if (payment.includes('dinheiro')) return 'Dinheiro';
+    if (payment.includes('pix')) return 'PIX';
+    if (payment.includes('débito') || payment.includes('debito')) return 'Débito';
+    if (payment.includes('crédito') || payment.includes('credito')) return 'Crédito';
+    return value || '—';
+  }
+
+  function saleGross(sale) {
+    return Number(sale.valorBruto ?? sale.subtotal ?? sale.total ?? 0);
+  }
+
+  function saleFee(sale) {
+    return Number(sale.valorTaxaDescontado ?? sale.feeAmount ?? 0);
+  }
+
+  function saleNet(sale) {
+    return Number(sale.valorLiquido ?? (sale.total === undefined ? saleGross(sale) : sale.total - saleFee(sale)));
+  }
+
+  function paymentFeeRate(payment) {
+    const normalized = normalizedPayment(payment);
+    if (normalized === 'Débito') return Number(state.paymentFees.debit) || 0;
+    if (normalized === 'Crédito') return Number(state.paymentFees.credit) || 0;
+    if (String(payment).toLowerCase().includes('maquininha')) return Number(state.paymentFees.machinePix) || 0;
+    return 0;
+  }
+
+  function roundMoney(value) {
+    return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+  }
+
   function monthKey(value) {
-    const date = new Date(value);
+    const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+      ? new Date(`${value}T12:00:00`)
+      : new Date(value);
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
   }
 
@@ -122,7 +177,76 @@ import {
   }
 
   function productPrice(product) {
-    return Math.max(0, Number(product.cost || 0) * (1 + Number(product.margin || 0) / 100));
+    if (Number.isFinite(Number(product.salePrice))) return roundMoney(Math.max(0, Number(product.salePrice)));
+    return roundMoney(Math.max(0, Number(product.cost || 0) * (1 + Number(product.margin || 0) / 100)));
+  }
+
+  function productBatches(product) {
+    const batches = Array.isArray(product.batches)
+      ? product.batches.filter(batch => Number(batch.qty) > 0).map((batch, index) => ({
+        id: batch.id || `lote-${index + 1}`,
+        qty: Number(batch.qty),
+        unitCost: Number(batch.unitCost ?? batch.cost ?? product.cost ?? 0),
+        expiry: batch.expiry || '',
+        receivedAt: batch.receivedAt || ''
+      }))
+      : [];
+    const lotQty = batches.reduce((sum, batch) => sum + batch.qty, 0);
+    const productQty = Number(product.qty) || 0;
+    if (!batches.length && productQty > 0) {
+      batches.push({
+        id: `legado-${product.id}`,
+        qty: productQty,
+        unitCost: Number(product.cost) || 0,
+        expiry: product.expiry || '',
+        receivedAt: product.createdAt || ''
+      });
+    } else if (productQty > lotQty) {
+      batches.push({
+        id: `legado-${product.id}`,
+        qty: productQty - lotQty,
+        unitCost: Number(product.cost) || 0,
+        expiry: product.expiry || '',
+        receivedAt: product.createdAt || ''
+      });
+    }
+    return batches.sort((a, b) => {
+      if (!a.expiry && b.expiry) return 1;
+      if (a.expiry && !b.expiry) return -1;
+      if (a.expiry && b.expiry && a.expiry !== b.expiry) return a.expiry.localeCompare(b.expiry);
+      return String(a.receivedAt).localeCompare(String(b.receivedAt));
+    });
+  }
+
+  function weightedBatchCost(batches) {
+    const qty = batches.reduce((sum, batch) => sum + Number(batch.qty), 0);
+    return qty ? batches.reduce((sum, batch) => sum + Number(batch.unitCost) * Number(batch.qty), 0) / qty : 0;
+  }
+
+  function productMarginAtPrice(price, cost) {
+    if (!Number(cost)) return price > 0 ? 100 : 0;
+    return ((Number(price) - Number(cost)) / Number(cost)) * 100;
+  }
+
+  function allocateFifo(batches, qty) {
+    let remaining = Number(qty);
+    const updatedBatches = batches.map(batch => ({ ...batch }));
+    const allocations = [];
+    for (const batch of updatedBatches) {
+      if (remaining <= 0) break;
+      const taken = Math.min(batch.qty, remaining);
+      if (taken <= 0) continue;
+      batch.qty -= taken;
+      remaining -= taken;
+      allocations.push({
+        batchId: batch.id,
+        qty: taken,
+        unitCost: Number(batch.unitCost),
+        expiry: batch.expiry || ''
+      });
+    }
+    if (remaining > 0) throw new Error(`Estoque insuficiente nos lotes. Faltam ${remaining} unidade(s).`);
+    return { batches: updatedBatches.filter(batch => batch.qty > 0), allocations };
   }
 
   function getActivePromotion(productId) {
@@ -131,7 +255,7 @@ import {
 
   function promotionDiscount(promo, price) {
     if (!promo) return 0;
-    return promo.type === 'percent' ? price * Number(promo.value) / 100 : Number(promo.value);
+    return roundMoney(promo.type === 'percent' ? price * Number(promo.value) / 100 : Number(promo.value));
   }
 
   function applyCollectionSnapshot(name, snapshot) {
@@ -142,6 +266,7 @@ import {
     if (name === 'vendas') state.sales = records.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
     if (name === 'financas') {
       const attendantConfig = records.find(item => item.id === 'config_atendentes');
+      const feeConfig = records.find(item => item.id === 'config_taxas');
       const attendantNames = attendantConfig && Array.isArray(attendantConfig.attendants)
         ? attendantConfig.attendants.filter(name => typeof name === 'string')
         : [];
@@ -150,6 +275,14 @@ import {
         : DEFAULT_ATTENDANTS.slice();
       state.finances = records.filter(item => item.type === 'expense' || item.type === 'sale')
         .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+      if (feeConfig) {
+        state.paymentFees = {
+          debit: Number(feeConfig.debit) || 0,
+          credit: Number(feeConfig.credit) || 0,
+          machinePix: Number(feeConfig.machinePix) || 0
+        };
+      }
+      renderFeeSettings();
       renderFinance();
       renderAttendants();
     }
@@ -235,17 +368,19 @@ import {
       return matchesQuery && (!sector || product.sector === sector);
     });
     $('#productsBody').innerHTML = filtered.length ? filtered.map(product => {
-      const expiry = expiryState(product.expiry);
+      const batches = productBatches(product);
+      const nearestExpiry = batches.find(batch => batch.expiry);
+      const expiry = expiryState(nearestExpiry ? nearestExpiry.expiry : product.expiry);
       const status = expiry.status ? `<span class="status-pill ${expiry.status}">${escapeHtml(expiry.text)}</span>` : '—';
       return `<tr>
         <td><div class="row-product"><span class="product-chip">${escapeHtml((product.name || '?').slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(product.name)}</strong><small>${escapeHtml(product.brand || 'Sem marca')}</small></span></div></td>
         <td>${escapeHtml(product.code || '—')}</td><td><span class="tag">${escapeHtml(product.sector)}</span> <span class="tag tag-green">${escapeHtml(product.tag)}</span></td>
-        <td>${Number(product.qty) || 0}</td><td>${currency(product.cost)}</td><td>${currency(productPrice(product))}</td><td>${status}</td>
-        <td><div class="inline-actions"><button class="table-action" data-edit-product="${escapeHtml(product.id)}" title="Editar produto" aria-label="Editar ${escapeHtml(product.name)}">✎</button><button class="table-action delete" data-delete-product="${escapeHtml(product.id)}" title="Excluir produto" aria-label="Excluir ${escapeHtml(product.name)}">×</button></div></td></tr>`;
+        <td>${Number(product.qty) || 0}<span class="table-subtext">${batches.length} lote(s)</span></td><td>${currency(weightedBatchCost(batches))}</td><td>${currency(productPrice(product))}<span class="table-subtext">margem média ${productMarginAtPrice(productPrice(product), weightedBatchCost(batches)).toFixed(1)}%</span></td><td>${status}</td>
+        <td><div class="inline-actions"><button class="table-action restock-action" data-restock-product="${escapeHtml(product.id)}" title="Reabastecer / + Lote" aria-label="Reabastecer ${escapeHtml(product.name)}">＋ Lote</button><button class="table-action" data-edit-product="${escapeHtml(product.id)}" title="Editar produto" aria-label="Editar ${escapeHtml(product.name)}">✎</button><button class="table-action delete" data-delete-product="${escapeHtml(product.id)}" title="Excluir produto" aria-label="Excluir ${escapeHtml(product.name)}">×</button></div></td></tr>`;
     }).join('') : '<tr><td colspan="8" class="empty-row">Nenhum produto encontrado. Cadastre um produto para começar.</td></tr>';
 
     const units = state.products.reduce((total, product) => total + (Number(product.qty) || 0), 0);
-    const cost = state.products.reduce((total, product) => total + Number(product.cost || 0) * (Number(product.qty) || 0), 0);
+    const cost = state.products.reduce((total, product) => total + productBatches(product).reduce((lotTotal, batch) => lotTotal + batch.unitCost * batch.qty, 0), 0);
     $('#stockTotal').textContent = units;
     $('#stockKinds').textContent = `${state.products.length} produto${state.products.length === 1 ? '' : 's'} cadastrado${state.products.length === 1 ? '' : 's'}`;
     $('#summaryProducts').textContent = state.products.length;
@@ -284,6 +419,11 @@ import {
     $('#productFormTitle').textContent = 'Novo produto';
     $('#saveProductButton').textContent = 'Salvar produto';
     $('#cancelProductEdit').classList.add('hidden');
+    $('#productInventoryHint').classList.add('hidden');
+    $('#productQty').disabled = false;
+    $('#productCost').disabled = false;
+    $('#productMargin').disabled = false;
+    $('#productExpiry').disabled = false;
     setTagOptions();
   }
 
@@ -295,7 +435,7 @@ import {
     $('#productName').value = product.name;
     $('#productBrand').value = product.brand || '';
     $('#productQty').value = product.qty;
-    $('#productCost').value = product.cost;
+    $('#productCost').value = weightedBatchCost(productBatches(product));
     $('#productMargin').value = product.margin;
     $('#productExpiry').value = product.expiry || '';
     $('#productSector').value = product.sector;
@@ -303,7 +443,123 @@ import {
     $('#productFormTitle').textContent = 'Editar produto';
     $('#saveProductButton').textContent = 'Salvar alterações';
     $('#cancelProductEdit').classList.remove('hidden');
+    $('#productInventoryHint').classList.remove('hidden');
+    $('#productQty').disabled = true;
+    $('#productCost').disabled = true;
+    $('#productMargin').disabled = true;
+    $('#productExpiry').disabled = true;
     $('#productForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function openRestockModal(productId) {
+    const product = state.products.find(item => item.id === productId);
+    if (!product) return;
+    const batches = productBatches(product);
+    const oldCost = weightedBatchCost(batches);
+    $('#restockProductId').value = product.id;
+    $('#restockProductName').textContent = product.name;
+    $('#restockCurrentPrice').textContent = currency(productPrice(product));
+    $('#restockOldCost').textContent = currency(oldCost);
+    $('#restockQty').value = '';
+    $('#restockUnitCost').value = '';
+    $('#restockExpiry').value = '';
+    $('#restockMargin').value = Number(product.margin) || 30;
+    $('#restockSalePrice').value = productPrice(product).toFixed(2);
+    $('#keepPriceLabel').textContent = `Manter Preço de Venda Atual (${currency(productPrice(product))})`;
+    $('input[name="restockPricing"][value="keep"]').checked = true;
+    $('#restockRepriceFields').classList.add('hidden');
+    $('#restockModal').classList.remove('hidden');
+    renderRestockPreview();
+    $('#restockQty').focus();
+  }
+
+  function renderRestockPreview() {
+    const product = state.products.find(item => item.id === $('#restockProductId').value);
+    if (!product) return;
+    const quantity = Math.max(0, Number($('#restockQty').value) || 0);
+    const newCost = Math.max(0, Number($('#restockUnitCost').value) || 0);
+    const currentPrice = productPrice(product);
+    const oldBatches = productBatches(product);
+    const oldQty = oldBatches.reduce((sum, batch) => sum + batch.qty, 0);
+    const oldCost = weightedBatchCost(oldBatches);
+    const desiredMargin = Math.max(0, Number($('#restockMargin').value) || 0);
+    const suggestedPrice = roundMoney(newCost * (1 + desiredMargin / 100));
+    const inputPrice = $('#restockSalePrice');
+    if (document.activeElement !== inputPrice) inputPrice.value = suggestedPrice.toFixed(2);
+    const selectedPrice = $('input[name="restockPricing"]:checked').value === 'recalculate'
+      ? Math.max(0, Number(inputPrice.value) || 0)
+      : currentPrice;
+    const blendedCost = quantity + oldQty > 0
+      ? (oldCost * oldQty + newCost * quantity) / (oldQty + quantity)
+      : newCost;
+    $('#restockCurrentPrice').textContent = currency(currentPrice);
+    $('#restockOldCost').textContent = currency(oldCost);
+    $('#restockNewCostPreview').textContent = currency(newCost);
+    $('#keepPriceLabel').textContent = `Manter Preço de Venda Atual (${currency(currentPrice)})`;
+    $('#keepMarginEstimate').textContent = `${productMarginAtPrice(currentPrice, newCost).toFixed(1)}%`;
+    $('#newMarginEstimate').textContent = `${productMarginAtPrice(selectedPrice, newCost).toFixed(1)}%`;
+    $('#blendedMarginEstimate').textContent = `${productMarginAtPrice(selectedPrice, blendedCost).toFixed(1)}%`;
+    $('#restockRepriceFields').classList.toggle('hidden', $('input[name="restockPricing"]:checked').value !== 'recalculate');
+  }
+
+  function closeRestockModal() {
+    $('#restockModal').classList.add('hidden');
+    $('#restockForm').reset();
+    $('#restockRepriceFields').classList.add('hidden');
+  }
+
+  async function registerRestock(event) {
+    event.preventDefault();
+    const submitButton = $('#confirmRestock');
+    if (submitButton.disabled) return;
+    submitButton.disabled = true;
+    try {
+      await runCloudAction(async () => {
+      const productId = $('#restockProductId').value;
+      const quantity = Number($('#restockQty').value);
+      const unitCost = Number($('#restockUnitCost').value);
+      const expiry = $('#restockExpiry').value;
+      const pricingMode = $('input[name="restockPricing"]:checked').value;
+      const margin = Number($('#restockMargin').value);
+      const manualSalePrice = Number($('#restockSalePrice').value);
+      if (!productId || !Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(unitCost) || unitCost < 0) {
+        throw new Error('Informe uma quantidade inteira e um custo unitário válido.');
+      }
+      if (pricingMode === 'recalculate' && (!Number.isFinite(margin) || margin < 0 || !Number.isFinite(manualSalePrice) || manualSalePrice < 0)) {
+        throw new Error('Informe uma margem e um preço de venda válidos.');
+      }
+      const productRef = doc(db, 'produtos', productId);
+      await runTransaction(db, async transaction => {
+        const snapshot = await transaction.get(productRef);
+        if (!snapshot.exists()) throw new Error('Este produto não existe mais no estoque.');
+        const product = { ...snapshot.data(), id: snapshot.id };
+        const batches = productBatches(product);
+        const salePrice = pricingMode === 'recalculate' ? manualSalePrice : productPrice(product);
+        batches.push({
+          id: `lote-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          qty: quantity,
+          unitCost,
+          expiry,
+          receivedAt: new Date().toISOString(),
+          salePriceAtReceipt: salePrice,
+          marginAtReceipt: productMarginAtPrice(salePrice, unitCost)
+        });
+        const totalQty = batches.reduce((sum, batch) => sum + Number(batch.qty), 0);
+        const averageCost = weightedBatchCost(batches);
+        transaction.update(productRef, {
+          batches,
+          qty: totalQty,
+          cost: averageCost,
+          salePrice,
+          margin: productMarginAtPrice(salePrice, averageCost),
+          lastRestockedAt: new Date().toISOString()
+        });
+      });
+        closeRestockModal();
+      }, 'Novo lote registrado no Firestore.');
+    } finally {
+      submitButton.disabled = false;
+    }
   }
 
   function renderServices() {
@@ -400,11 +656,11 @@ import {
       const price = productPrice(product);
       const promo = getActivePromotion(product.id);
       const unitDiscount = promo && line.qty >= Number(promo.minQty) ? Math.min(price, promotionDiscount(promo, price)) : 0;
-      return { name: product.name, price, cost: Number(product.cost), unitDiscount, subtotal: Math.max(0, price - unitDiscount) * line.qty };
+      return { name: product.name, price, cost: Number(product.cost), unitDiscount, subtotal: roundMoney(Math.max(0, price - unitDiscount) * line.qty) };
     }
     const service = state.services.find(item => item.id === line.id);
     if (!service) return null;
-    return { name: service.name, price: Number(service.price), cost: Number(service.cost), unitDiscount: 0, subtotal: Number(service.price) * line.qty };
+    return { name: service.name, price: Number(service.price), cost: Number(service.cost), unitDiscount: 0, subtotal: roundMoney(Number(service.price) * line.qty) };
   }
 
   function getCartTotals() {
@@ -438,6 +694,12 @@ import {
     $('#promoSaving').textContent = `− ${currency(totals.promoDiscount)}`;
     $('#promoSavingRow').classList.toggle('hidden', totals.promoDiscount <= 0);
     $('#cartTotal').textContent = currency(totals.total);
+    const payment = $('#paymentMethod').value;
+    const feeRate = paymentFeeRate(payment);
+    const feeAmount = roundMoney(totals.total * feeRate / 100);
+    $('#cartFeeLabel').textContent = `Taxa da maquininha (${feeRate.toLocaleString('pt-BR')}%)`;
+    $('#cartFee').textContent = `− ${currency(feeAmount)}`;
+    $('#cartNetTotal').textContent = currency(totals.total - feeAmount);
     $('#discountReason').disabled = totals.manualDiscount <= 0;
     if (totals.manualDiscount <= 0) $('#discountReason').value = '';
     $('#finishSale').disabled = !cart.length || !cloudReady;
@@ -471,7 +733,7 @@ import {
     const attendant = $('#attendantSelect').value;
     if (!attendant || !state.attendants.includes(attendant)) throw new Error('Selecione um atendente válido.');
 
-    const saleItems = cart.map(line => {
+    const saleLines = cart.map(line => {
       const data = cartLineData(line);
       if (!data) throw new Error('Um item do carrinho não está mais disponível. Atualize o carrinho.');
       return {
@@ -484,78 +746,236 @@ import {
     const financeRef = doc(collection(db, 'financas'));
     const productLines = cart.filter(line => line.type === 'product');
     const productRefs = productLines.map(line => ({ line, ref: doc(db, 'produtos', line.id) }));
-    const timestamp = new Date().toISOString();
-    const sale = {
-      number: makeNumber(), date: timestamp, items: saleItems,
+    const now = new Date();
+    const timestamp = now.toISOString();
+    const formaPagamento = $('#paymentMethod').value;
+    const taxaAplicada = paymentFeeRate(formaPagamento);
+    const valorBruto = totals.total;
+    const valorTaxaDescontado = roundMoney(valorBruto * taxaAplicada / 100);
+    const valorLiquido = roundMoney(valorBruto - valorTaxaDescontado);
+    const saleBase = {
+      number: makeNumber(), date: timestamp, data: dateOnly(now),
+      hora: now.toLocaleTimeString('pt-BR', { hour12: false }),
       subtotal: totals.subtotal, promoDiscount: totals.promoDiscount,
       manualDiscount: totals.manualDiscount, discountReason: totals.manualDiscount ? reason : '',
-      total: totals.total, payment: $('#paymentMethod').value, attendant,
-      cmv: saleItems.filter(item => item.type === 'product').reduce((sum, item) => sum + item.unitCost * item.qty, 0)
+      total: valorBruto, valorBruto, taxaAplicada, valorTaxaDescontado, valorLiquido,
+      payment: formaPagamento, formaPagamento, attendant, atendente: attendant
     };
-    const financeEntry = {
-      type: 'sale', relatedSaleId: saleRef.id, number: sale.number, date: timestamp,
-      subtotal: sale.subtotal, total: sale.total, promoDiscount: sale.promoDiscount,
-      manualDiscount: sale.manualDiscount, cmv: sale.cmv, payment: sale.payment, attendant
-    };
+    let committedSale;
 
     await runTransaction(db, async transaction => {
       const productSnapshots = await Promise.all(productRefs.map(item => transaction.get(item.ref)));
+      const allocationsById = new Map();
       productSnapshots.forEach((snapshot, index) => {
         const { line } = productRefs[index];
         if (!snapshot.exists()) throw new Error(`O produto "${line.id}" não existe mais no estoque.`);
-        const currentQty = Number(snapshot.data().qty) || 0;
-        if (currentQty < line.qty) throw new Error(`Estoque insuficiente para ${snapshot.data().name}. Disponível: ${currentQty}.`);
+        const batches = productBatches({ ...snapshot.data(), id: line.id });
+        const availableQty = batches.reduce((sum, batch) => sum + batch.qty, 0);
+        if (availableQty < line.qty) throw new Error(`Estoque insuficiente para ${snapshot.data().name}. Disponível: ${availableQty}.`);
+        allocationsById.set(line.id, allocateFifo(batches, line.qty));
       });
+
+      const saleItems = saleLines.map(line => {
+        const allocation = line.type === 'product' ? allocationsById.get(line.id) : null;
+        const exactCost = allocation
+          ? allocation.allocations.reduce((sum, lot) => sum + lot.unitCost * lot.qty, 0)
+          : line.unitCost * line.qty;
+        const productCost = allocation ? exactCost : 0;
+        const serviceCost = line.type === 'service' ? exactCost : 0;
+        return {
+          ...line,
+          unitCost: line.qty ? exactCost / line.qty : 0,
+          cmv: productCost,
+          serviceCost,
+          lotAllocations: allocation ? allocation.allocations : [],
+          _revenueBeforeManual: Number(line.total) || 0
+        };
+      });
+      const discountBase = saleItems.reduce((sum, item) => sum + item._revenueBeforeManual, 0);
+      let manualDiscountRemaining = totals.manualDiscount;
+      let feeRemaining = valorTaxaDescontado;
+      const pricedItems = saleItems.map((item, index) => {
+        const lastItem = index === saleItems.length - 1;
+        const manualDiscountAllocated = lastItem
+          ? roundMoney(manualDiscountRemaining)
+          : roundMoney(discountBase > 0 ? totals.manualDiscount * item._revenueBeforeManual / discountBase : 0);
+        manualDiscountRemaining = roundMoney(manualDiscountRemaining - manualDiscountAllocated);
+        const valorPraticado = roundMoney(item._revenueBeforeManual - manualDiscountAllocated);
+        const lucroBruto = roundMoney(valorPraticado - item.cmv - item.serviceCost);
+        const taxaRateada = lastItem
+          ? roundMoney(feeRemaining)
+          : roundMoney(valorBruto > 0 ? valorTaxaDescontado * valorPraticado / valorBruto : 0);
+        feeRemaining = roundMoney(feeRemaining - taxaRateada);
+        const { _revenueBeforeManual, ...persistedItem } = item;
+        return {
+          ...persistedItem,
+          manualDiscountAllocated,
+          valorPraticado,
+          taxaRateada,
+          lucroBruto,
+          lucroLiquido: roundMoney(lucroBruto - taxaRateada)
+        };
+      });
+      const cmv = pricedItems.reduce((sum, item) => sum + Number(item.cmv || 0), 0);
+      const lucroBruto = roundMoney(pricedItems.reduce((sum, item) => sum + Number(item.lucroBruto || 0), 0));
+      const lucroLiquido = roundMoney(pricedItems.reduce((sum, item) => sum + Number(item.lucroLiquido || 0), 0));
+      committedSale = { ...saleBase, items: pricedItems, cmv, lucroBruto, lucroLiquido };
+
       productSnapshots.forEach((snapshot, index) => {
         const { line, ref } = productRefs[index];
-        transaction.update(ref, { qty: Number(snapshot.data().qty) - line.qty });
+        const allocation = allocationsById.get(line.id);
+        const updatedBatches = allocation.batches;
+        const remainingQty = updatedBatches.reduce((sum, batch) => sum + batch.qty, 0);
+        const averageCost = weightedBatchCost(updatedBatches);
+        const salePrice = productPrice(snapshot.data());
+        transaction.update(ref, {
+          batches: updatedBatches,
+          qty: remainingQty,
+          cost: averageCost,
+          margin: productMarginAtPrice(salePrice, averageCost)
+        });
       });
-      transaction.set(saleRef, sale);
-      transaction.set(financeRef, financeEntry);
+      transaction.set(saleRef, committedSale);
+      transaction.set(financeRef, {
+        type: 'sale', relatedSaleId: saleRef.id, number: committedSale.number,
+        date: timestamp, data: committedSale.data, hora: committedSale.hora,
+        subtotal: committedSale.subtotal, total: committedSale.total,
+        valorBruto, taxaAplicada, valorTaxaDescontado, valorLiquido,
+        formaPagamento, payment: formaPagamento, atendente: attendant, attendant,
+        promoDiscount: committedSale.promoDiscount, manualDiscount: committedSale.manualDiscount,
+        cmv: committedSale.cmv, lucroBruto: committedSale.lucroBruto,
+        lucroLiquido: committedSale.lucroLiquido, items: committedSale.items
+      });
     });
 
     cart = [];
     $('#manualDiscount').value = '0';
     $('#discountReason').value = '';
-    $('#saleModalMessage').textContent = `Total de ${currency(sale.total)} recebido via ${sale.payment}. Atendente: ${attendant}.`;
+    $('#saleModalMessage').textContent = `${currency(committedSale.valorBruto)} recebidos via ${formaPagamento}; líquido após taxa: ${currency(committedSale.valorLiquido)}. Atendente: ${attendant}.`;
     $('#saleModal').classList.remove('hidden');
     renderCart();
   }
 
   function renderSales() {
     const query = $('#historySearch').value.trim().toLowerCase();
-    const filtered = state.sales.filter(sale => `${sale.number || ''} ${sale.payment || ''} ${sale.attendant || ''} ${sale.discountReason || ''} ${(sale.items || []).map(item => item.name).join(' ')}`.toLowerCase().includes(query));
+    const specificDate = $('#historyDateFilter').value;
+    const paymentFilter = $('#historyPaymentFilter').value;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const fromDate = historyFilters.rangeDays
+      ? new Date(today.getTime() - (historyFilters.rangeDays - 1) * 86400000)
+      : null;
+    const filtered = state.sales.filter(sale => {
+      const saleDay = saleDate(sale);
+      const saleDayStart = new Date(`${saleDay}T00:00:00`);
+      const searchable = `${sale.number || ''} ${salePayment(sale)} ${sale.attendant || sale.atendente || ''} ${sale.discountReason || ''} ${(sale.items || []).map(item => item.name).join(' ')}`.toLowerCase();
+      if (specificDate && saleDay !== specificDate) return false;
+      if (!specificDate && fromDate && saleDayStart < fromDate) return false;
+      if (paymentFilter && normalizedPayment(salePayment(sale)) !== paymentFilter) return false;
+      return !query || searchable.includes(query);
+    });
     const rowHtml = sale => {
       const names = (sale.items || []).map(item => `${escapeHtml(item.name)} ×${item.qty}`).join(', ');
-      const discounts = Number(sale.promoDiscount || 0) + Number(sale.manualDiscount || 0);
-      const manualNote = sale.manualDiscount > 0 ? `<span class="table-subtext">${escapeHtml(sale.discountReason || 'Sem justificativa')}</span>` : '';
-      return `<tr><td><span class="sale-id">#${escapeHtml(sale.number || '')}</span><span class="table-subtext">${escapeHtml(sale.attendant || 'Sem atendente')}</span></td><td>${dateTime(sale.date)}</td><td><span class="history-items">${names || '—'}</span></td><td><span class="tag">${escapeHtml(sale.payment || '—')}</span></td><td>${discounts ? currency(discounts) : '—'}${manualNote}</td><td class="align-right"><strong>${currency(sale.total)}</strong></td></tr>`;
+      const attendant = sale.attendant || sale.atendente || 'Sem atendente';
+      return `<tr><td><span class="sale-id">${escapeHtml(saleTime(sale))}</span><span class="table-subtext">#${escapeHtml(sale.number || '')} · ${formatDate(saleDate(sale))}</span></td><td><span class="history-items">${names || '—'}</span></td><td>${escapeHtml(attendant)}</td><td><span class="tag">${escapeHtml(salePayment(sale))}</span></td><td>${currency(saleGross(sale))}</td><td>${currency(saleFee(sale))}${Number(sale.taxaAplicada) ? `<span class="table-subtext">${Number(sale.taxaAplicada)}%</span>` : ''}</td><td class="align-right"><strong>${currency(saleNet(sale))}</strong></td></tr>`;
     };
-    $('#salesHistoryBody').innerHTML = filtered.length ? filtered.map(rowHtml).join('') : '<tr><td colspan="6" class="empty-row">Nenhuma venda registrada.</td></tr>';
-    $('#recentSalesBody').innerHTML = state.sales.length ? state.sales.slice(0, 5).map(sale => `<tr><td><span class="sale-id">#${escapeHtml(sale.number || '')}</span><span class="table-subtext">${escapeHtml(sale.attendant || '')}</span></td><td>${dateTime(sale.date)}</td><td>${(sale.items || []).reduce((sum, item) => sum + Number(item.qty), 0)} item(ns)</td><td><span class="tag">${escapeHtml(sale.payment || '—')}</span></td><td class="align-right"><strong>${currency(sale.total)}</strong></td></tr>`).join('') : '<tr><td colspan="5" class="empty-row">As vendas aparecerão aqui após a primeira venda.</td></tr>';
+    $('#salesHistoryBody').innerHTML = filtered.length ? filtered.map(rowHtml).join('') : '<tr><td colspan="7" class="empty-row">Nenhuma venda corresponde aos filtros selecionados.</td></tr>';
+    $('#recentSalesBody').innerHTML = state.sales.length ? state.sales.slice(0, 5).map(sale => `<tr><td><span class="sale-id">#${escapeHtml(sale.number || '')}</span><span class="table-subtext">${escapeHtml(sale.attendant || sale.atendente || '')}</span></td><td>${dateTime(sale.date)}</td><td>${(sale.items || []).reduce((sum, item) => sum + Number(item.qty), 0)} item(ns)</td><td><span class="tag">${escapeHtml(salePayment(sale))}</span></td><td class="align-right"><strong>${currency(saleNet(sale))}</strong></td></tr>`).join('') : '<tr><td colspan="5" class="empty-row">As vendas aparecerão aqui após a primeira venda.</td></tr>';
+  }
+
+  function renderPreviousMonths() {
+    const currentMonth = monthKey(new Date());
+    const monthKeys = new Set();
+    state.sales.forEach(sale => monthKeys.add(monthKey(`${saleDate(sale)}T12:00:00`)));
+    state.finances.filter(entry => entry.type === 'expense').forEach(entry => monthKeys.add(monthKey(`${entry.date}T12:00:00`)));
+    const previousKeys = [...monthKeys].filter(key => key < currentMonth).sort((a, b) => b.localeCompare(a));
+    $('#previousMonths').innerHTML = previousKeys.length ? previousKeys.map(key => {
+      const monthSales = state.sales.filter(sale => monthKey(`${saleDate(sale)}T12:00:00`) === key);
+      const monthExpenses = state.finances.filter(entry => entry.type === 'expense' && monthKey(`${entry.date}T12:00:00`) === key);
+      const gross = monthSales.reduce((sum, sale) => sum + Number(sale.subtotal === undefined ? saleGross(sale) : sale.subtotal), 0);
+      const fees = monthSales.reduce((sum, sale) => sum + saleFee(sale), 0);
+      const cmv = monthSales.reduce((sum, sale) => sum + Number(sale.cmv || (sale.items || []).filter(item => item.type === 'product').reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0)), 0);
+      const discounts = monthSales.reduce((sum, sale) => sum + Number(sale.promoDiscount || 0) + Number(sale.manualDiscount || 0), 0);
+      const expenses = monthExpenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
+      const serviceCosts = monthSales.reduce((sum, sale) => sum + (sale.items || []).filter(item => item.type === 'service').reduce((subtotal, item) => subtotal + Number(item.unitCost || 0) * Number(item.qty || 0), 0), 0);
+      const profitFromSales = monthSales.reduce((sum, sale) => {
+        if (Number.isFinite(Number(sale.lucroLiquido))) return sum + Number(sale.lucroLiquido);
+        return sum + saleNet(sale) - Number(sale.cmv || 0)
+          - (sale.items || []).filter(item => item.type === 'service')
+            .reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0);
+      }, 0);
+      const profit = profitFromSales - expenses;
+      const days = new Set([...monthSales.map(sale => saleDate(sale)), ...monthExpenses.map(expense => expense.date)]).size;
+      const dayKeys = [...new Set([...monthSales.map(sale => saleDate(sale)), ...monthExpenses.map(expense => expense.date)])].sort((a, b) => b.localeCompare(a));
+      return `<details class="month-detail"><summary>
+        <span class="month-title"><strong>${new Date(`${key}-01T12:00:00`).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' })}</strong><small>${monthSales.length} venda(s) · ${days} dia(s) movimentado(s)</small></span>
+        <span class="month-summary-item"><small>Faturamento Bruto</small><strong>${currency(gross)}</strong></span>
+        <span class="month-summary-item"><small>Total em Taxas</small><strong>${currency(fees)}</strong></span>
+        <span class="month-summary-item"><small>CMV</small><strong>${currency(cmv)}</strong></span>
+        <span class="month-summary-item"><small>Despesas</small><strong>${currency(expenses)}</strong></span>
+        <span class="month-summary-item month-profit"><small>Lucro Líquido Real</small><strong>${currency(profit)}</strong></span>
+      </summary>
+      <div class="month-days">${dayKeys.map(day => {
+        const daySales = monthSales.filter(sale => saleDate(sale) === day);
+        const dayExpenses = monthExpenses.filter(expense => expense.date === day);
+        const dayGross = daySales.reduce((sum, sale) => sum + saleGross(sale), 0);
+        const dayFees = daySales.reduce((sum, sale) => sum + saleFee(sale), 0);
+        const dayNet = daySales.reduce((sum, sale) => sum + saleNet(sale), 0);
+        return `<details class="day-detail"><summary><strong>${formatDate(day)}</strong><span>${daySales.length} venda(s)</span><span>Bruto ${currency(dayGross)}</span><span>Taxas ${currency(dayFees)}</span><span>Líquido ${currency(dayNet)}</span></summary>
+          <div class="table-scroll"><table><thead><tr><th>HORA</th><th>VENDA / DESPESA</th><th>ATENDENTE / CATEGORIA</th><th>FORMA DE PAGAMENTO</th><th>BRUTO</th><th>TAXA / DESPESA</th><th>LÍQUIDO</th></tr></thead><tbody>
+          ${daySales.map(sale => `<tr><td>${escapeHtml(saleTime(sale))}</td><td>#${escapeHtml(sale.number || '')} · ${escapeHtml((sale.items || []).map(item => item.name).join(', '))}</td><td>${escapeHtml(sale.attendant || sale.atendente || '—')}</td><td>${escapeHtml(salePayment(sale))}</td><td>${currency(saleGross(sale))}</td><td>${currency(saleFee(sale))}</td><td>${currency(saleNet(sale))}</td></tr>`).join('')}
+          ${dayExpenses.map(expense => `<tr><td>—</td><td>${escapeHtml(expense.description)}</td><td>${escapeHtml(expense.category)}</td><td>Despesa</td><td>—</td><td>− ${currency(expense.amount)}</td><td>—</td></tr>`).join('')}
+          ${daySales.length || dayExpenses.length ? '' : '<tr><td colspan="7" class="empty-row">Sem movimentações neste dia.</td></tr>'}
+          </tbody></table></div></details>`;
+      }).join('')}</div></details>`;
+    }).join('') : '<div class="cart-empty">Os fechamentos dos meses anteriores aparecerão aqui.</div>';
+  }
+
+  function renderFeeSettings() {
+    const fields = [
+      ['feeDebit', state.paymentFees.debit],
+      ['feeCredit', state.paymentFees.credit],
+      ['feeMachinePix', state.paymentFees.machinePix]
+    ];
+    fields.forEach(([id, value]) => {
+      const input = $(`#${id}`);
+      if (document.activeElement !== input) input.value = Number(value) || 0;
+    });
+    renderCart();
   }
 
   function renderFinance() {
-    const monthSales = state.sales.filter(sale => isCurrentMonth(sale.date));
+    const monthSales = state.sales.filter(sale => isCurrentMonth(saleDate(sale)));
     const monthExpenses = state.finances.filter(entry => entry.type === 'expense' && isCurrentMonth(entry.date));
     const gross = monthSales.reduce((sum, sale) => sum + Number(sale.subtotal === undefined ? sale.total || 0 : sale.subtotal), 0);
     const cmv = monthSales.reduce((sum, sale) => sum + Number(sale.cmv || 0), 0);
     const expenses = monthExpenses.reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
     const discounts = monthSales.reduce((sum, sale) => sum + Number(sale.promoDiscount || 0) + Number(sale.manualDiscount || 0), 0);
+    const monthFees = monthSales.reduce((sum, sale) => sum + saleFee(sale), 0);
+    const totalFees = state.sales.reduce((sum, sale) => sum + saleFee(sale), 0);
     const serviceCosts = monthSales.reduce((sum, sale) => sum + (sale.items || []).filter(item => item.type === 'service').reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0), 0);
     $('#financeGross').textContent = currency(gross);
     $('#financeCmv').textContent = currency(cmv);
     $('#financeExpenses').textContent = currency(expenses);
     $('#financeDiscounts').textContent = currency(discounts);
-    $('#financeProfit').textContent = currency(gross - discounts - cmv - serviceCosts - expenses);
+    $('#financeFees').textContent = currency(totalFees);
+    $('#financeFeesCaption').textContent = `acumulado em todo o histórico · ${currency(monthFees)} neste mês`;
+    const profitFromSales = monthSales.reduce((sum, sale) => {
+      if (Number.isFinite(Number(sale.lucroLiquido))) return sum + Number(sale.lucroLiquido);
+      return sum + saleNet(sale) - Number(sale.cmv || 0)
+        - (sale.items || []).filter(item => item.type === 'service')
+          .reduce((total, item) => total + Number(item.unitCost || 0) * Number(item.qty || 0), 0);
+    }, 0);
+    $('#financeProfit').textContent = currency(profitFromSales - expenses);
     $('#financeMonth').textContent = new Date().toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
     $('#expensesList').innerHTML = monthExpenses.length ? monthExpenses.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map(expense => `<div class="expense-entry"><span><strong>${escapeHtml(expense.description)}</strong><small>${escapeHtml(expense.category)} · ${formatDate(expense.date)}</small></span><span class="expense-value">− ${currency(expense.amount)}</span></div>`).join('') : '<div class="cart-empty">Nenhuma despesa registrada neste mês.</div>';
-    const todaySales = state.sales.filter(sale => dateOnly(sale.date) === dateOnly(new Date()));
+    const todaySales = state.sales.filter(sale => saleDate(sale) === dateOnly(new Date()));
     const todayAmount = todaySales.reduce((sum, sale) => sum + Number(sale.total || 0), 0);
     $('#todayRevenue').textContent = currency(todayAmount);
     $('#todaySalesCount').textContent = `${todaySales.length} venda${todaySales.length === 1 ? '' : 's'} realizada${todaySales.length === 1 ? '' : 's'}`;
     $('#monthRevenue').textContent = currency(monthSales.reduce((sum, sale) => sum + Number(sale.total || 0), 0));
     $('#monthSalesCount').textContent = `${monthSales.length} venda${monthSales.length === 1 ? '' : 's'} realizada${monthSales.length === 1 ? '' : 's'}`;
+    renderPreviousMonths();
   }
 
   function renderAll() {
@@ -596,22 +1016,70 @@ import {
     event.preventDefault();
     runCloudAction(async () => {
       const id = $('#productId').value;
-      const product = {
+      const productFields = {
         code: $('#productCode').value.trim(), name: $('#productName').value.trim(),
-        brand: $('#productBrand').value.trim(), qty: Number($('#productQty').value),
-        cost: Number($('#productCost').value), margin: Number($('#productMargin').value),
-        expiry: $('#productExpiry').value, sector: $('#productSector').value, tag: $('#productTag').value
+        brand: $('#productBrand').value.trim(),
+        sector: $('#productSector').value, tag: $('#productTag').value
       };
-      if (!product.name || !SECTOR_TAGS[product.sector] || !SECTOR_TAGS[product.sector].includes(product.tag) || product.qty < 0 || product.cost < 0 || product.margin < 0) throw new Error('Confira os dados do produto antes de salvar.');
-      if (id) await updateDoc(doc(db, 'produtos', id), product);
-      else await setDoc(doc(collection(db, 'produtos')), product);
+      if (!productFields.name || !SECTOR_TAGS[productFields.sector] || !SECTOR_TAGS[productFields.sector].includes(productFields.tag)) {
+        throw new Error('Confira nome, setor e etiqueta antes de salvar.');
+      }
+      if (id) {
+        const productRef = doc(db, 'produtos', id);
+        await runTransaction(db, async transaction => {
+          const snapshot = await transaction.get(productRef);
+          if (!snapshot.exists()) throw new Error('Este produto não existe mais no estoque.');
+          const current = { ...snapshot.data(), id };
+          const batches = productBatches(current);
+          const cost = weightedBatchCost(batches);
+          transaction.update(productRef, {
+            ...productFields,
+            batches,
+            qty: batches.reduce((sum, batch) => sum + batch.qty, 0),
+            cost,
+            salePrice: productPrice(current),
+            margin: productMarginAtPrice(productPrice(current), cost)
+          });
+        });
+      } else {
+        const qty = Number($('#productQty').value);
+        const cost = Number($('#productCost').value);
+        const margin = Number($('#productMargin').value);
+        const expiry = $('#productExpiry').value;
+        if (!Number.isInteger(qty) || qty < 0 || !Number.isFinite(cost) || cost < 0 || !Number.isFinite(margin) || margin < 0) {
+          throw new Error('Informe quantidade, custo e margem válidos.');
+        }
+        const productRef = doc(collection(db, 'produtos'));
+        const salePrice = roundMoney(cost * (1 + margin / 100));
+        const initialBatch = qty > 0 ? [{
+          id: `lote-inicial-${Date.now()}`,
+          qty,
+          unitCost: cost,
+          expiry,
+          receivedAt: new Date().toISOString(),
+          salePriceAtReceipt: salePrice,
+          marginAtReceipt: margin
+        }] : [];
+        await setDoc(productRef, {
+          ...productFields,
+          qty,
+          cost,
+          margin,
+          salePrice,
+          expiry,
+          batches: initialBatch,
+          createdAt: new Date().toISOString()
+        });
+      }
       resetProductForm();
     }, $('#productId').value ? 'Produto atualizado na nuvem.' : 'Produto cadastrado na nuvem.');
   });
   $('#cancelProductEdit').addEventListener('click', resetProductForm);
   $('#productsBody').addEventListener('click', event => {
+    const restock = event.target.closest('[data-restock-product]');
     const edit = event.target.closest('[data-edit-product]');
     const remove = event.target.closest('[data-delete-product]');
+    if (restock) return openRestockModal(restock.dataset.restockProduct);
     if (edit) return editProduct(edit.dataset.editProduct);
     if (remove) {
       const product = state.products.find(item => item.id === remove.dataset.deleteProduct);
@@ -623,6 +1091,17 @@ import {
         cart = cart.filter(line => !(line.type === 'product' && line.id === product.id));
       }, 'Produto excluído da nuvem.');
     }
+  });
+  $('#restockUnitCost').addEventListener('input', renderRestockPreview);
+  $('#restockQty').addEventListener('input', renderRestockPreview);
+  $('#restockMargin').addEventListener('input', renderRestockPreview);
+  $('#restockSalePrice').addEventListener('input', renderRestockPreview);
+  $$('input[name="restockPricing"]').forEach(input => input.addEventListener('change', renderRestockPreview));
+  $('#restockForm').addEventListener('submit', registerRestock);
+  $('#cancelRestock').addEventListener('click', closeRestockModal);
+  $('#closeRestockModal').addEventListener('click', closeRestockModal);
+  $('#restockModal').addEventListener('click', event => {
+    if (event.target === $('#restockModal')) closeRestockModal();
   });
   $('#stockSearch').addEventListener('input', renderStock);
   $('#stockFilter').addEventListener('change', renderStock);
@@ -703,6 +1182,7 @@ import {
     }
   });
   $('#manualDiscount').addEventListener('input', renderCart);
+  $('#paymentMethod').addEventListener('change', renderCart);
   $('#clearCart').addEventListener('click', () => {
     cart = [];
     $('#manualDiscount').value = '0';
@@ -735,6 +1215,38 @@ import {
     $('#expenseAmount').focus();
   }));
   $('#historySearch').addEventListener('input', renderSales);
+  $('#historyDateFilter').addEventListener('change', () => {
+    historyFilters.rangeDays = null;
+    $$('[data-history-range]').forEach(button => button.classList.toggle('active', button.dataset.historyRange === 'all' && !$('#historyDateFilter').value));
+    renderSales();
+  });
+  $('#historyPaymentFilter').addEventListener('change', renderSales);
+  $$('[data-history-range]').forEach(button => button.addEventListener('click', () => {
+    const value = button.dataset.historyRange;
+    historyFilters.rangeDays = value === '7' || value === '30' ? Number(value) : null;
+    $('#historyDateFilter').value = '';
+    $$('[data-history-range]').forEach(item => item.classList.toggle('active', item === button));
+    renderSales();
+  }));
+
+  $('#feeSettingsForm').addEventListener('submit', event => {
+    event.preventDefault();
+    runCloudAction(async () => {
+      const paymentFees = {
+        debit: Number($('#feeDebit').value),
+        credit: Number($('#feeCredit').value),
+        machinePix: Number($('#feeMachinePix').value)
+      };
+      if (Object.values(paymentFees).some(value => !Number.isFinite(value) || value < 0 || value > 100)) {
+        throw new Error('Informe taxas entre 0% e 100%.');
+      }
+      await setDoc(doc(db, 'financas', 'config_taxas'), {
+        type: 'config', ...paymentFees, updatedAt: new Date().toISOString()
+      }, { merge: true });
+      state.paymentFees = paymentFees;
+      renderCart();
+    }, 'Taxas salvas e sincronizadas com os outros caixas.');
+  });
 
   $('#addAttendant').addEventListener('click', () => runCloudAction(async () => {
     const name = $('#attendantNewName').value.trim();
