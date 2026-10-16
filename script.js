@@ -691,28 +691,60 @@ import {
     $('#summaryUnits').textContent = units;
     $('#stockCostValue').textContent = currency(cost);
     $('#stockNavCount').textContent = units;
-    const attention = state.products.filter(product => {
-      const expiry = expiryState(product.expiry);
-      return Number(product.qty) > 0 && ((expiry.days !== undefined && expiry.days <= 30) || Number(product.qty) <= 5);
-    });
-    $('#attentionCount').textContent = attention.length;
-    renderAlerts(attention);
+    renderAlerts(state.products);
     renderPromotionProductSelect();
     renderCatalog();
   }
 
   function renderAlerts(products) {
-    const alerts = products.slice().sort((a, b) => {
-      const aDays = expiryState(a.expiry).days;
-      const bDays = expiryState(b.expiry).days;
-      return (aDays === undefined ? 9999 : aDays) - (bDays === undefined ? 9999 : bDays);
-    }).slice(0, 5);
-    $('#stockAlerts').innerHTML = alerts.length ? alerts.map(product => {
-      const expiry = expiryState(product.expiry);
-      const expired = expiry.days !== undefined && expiry.days < 0;
-      const near = expiry.days !== undefined && expiry.days <= 30;
-      const detail = near ? expiry.text : `Estoque baixo · ${product.qty} unidade${Number(product.qty) === 1 ? '' : 's'}`;
-      return `<div class="alert-item"><span class="alert-marker ${expired || Number(product.qty) <= 2 ? 'danger' : 'warning'}"></span><span class="alert-copy"><strong>${escapeHtml(product.name)}</strong><small>${escapeHtml(detail)}</small></span><span class="alert-qty">${Number(product.qty)} un.</span></div>`;
+    const alerts = [];
+    let riskValue = 0;
+
+    products.forEach(product => {
+      const productName = product.name || 'Produto sem nome';
+      const quantity = Number(product.qty) || 0;
+      productBatches(product).forEach(batch => {
+        const expiry = expiryState(batch.expiry);
+        if (expiry.days === undefined || expiry.days > 30) return;
+
+        const expired = expiry.days < 0;
+        const risk = Math.max(0, Number(batch.qty) || 0) * Math.max(0, Number(batch.unitCost) || 0);
+        riskValue += risk;
+        alerts.push({
+          productKey: product.id || productName,
+          productName,
+          type: expired ? 'expired' : 'expiring',
+          days: expiry.days,
+          detail: expired
+            ? `Lote vencido · ${batch.qty} un. · venceu em ${formatDate(batch.expiry)}`
+            : `Vence em ${expiry.days} dia${expiry.days === 1 ? '' : 's'} · ${batch.qty} un. · ${formatDate(batch.expiry)}`,
+          quantity: batch.qty,
+          risk
+        });
+      });
+
+      if (quantity > 0 && quantity <= 5) {
+        alerts.push({
+          productKey: product.id || productName,
+          productName,
+          type: 'low-stock',
+          days: Infinity,
+          detail: `Estoque baixo · ${quantity} unidade${quantity === 1 ? '' : 's'}`,
+          quantity,
+          risk: 0
+        });
+      }
+    });
+
+    alerts.sort((a, b) => a.days - b.days || a.productName.localeCompare(b.productName));
+    $('#attentionCount').textContent = new Set(alerts.map(alert => alert.productKey)).size;
+    $('#stockRiskValue').textContent = currency(riskValue);
+    $('#stockAlerts').innerHTML = alerts.length ? alerts.map(alert => {
+      const marker = alert.type === 'expired' || (alert.type === 'low-stock' && alert.quantity <= 2)
+        ? 'danger'
+        : 'warning';
+      const risk = alert.risk > 0 ? `<small>Em risco: ${currency(alert.risk)}</small>` : '';
+      return `<div class="alert-item"><span class="alert-marker ${marker}"></span><span class="alert-copy"><strong>${escapeHtml(alert.productName)}</strong><small>${escapeHtml(alert.detail)}</small>${risk}</span><span class="alert-qty">${alert.quantity} un.</span></div>`;
     }).join('') : '<div class="cart-empty">Tudo certo com o estoque.<br>Sem alertas no momento.</div>';
   }
 

@@ -52,7 +52,7 @@
             <article class="metric-card"><div class="metric-top"><span>Vendas de hoje</span><span class="metric-icon green-icon">↗</span></div><strong id="todayRevenue">R$ 0,00</strong><small id="todaySalesCount">0 vendas realizadas</small></article>
             <article class="metric-card"><div class="metric-top"><span>Vendas no mês</span><span class="metric-icon blue-icon">▣</span></div><strong id="monthRevenue">R$ 0,00</strong><small id="monthSalesCount">0 vendas realizadas</small></article>
             <article class="metric-card"><div class="metric-top"><span>Itens em estoque</span><span class="metric-icon purple-icon">▤</span></div><strong id="stockTotal">0</strong><small id="stockKinds">0 produtos cadastrados</small></article>
-            <article class="metric-card"><div class="metric-top"><span>Atenção ao estoque</span><span class="metric-icon orange-icon">⚠</span></div><strong id="attentionCount">0</strong><small>produtos vencidos ou próximos</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Atenção ao estoque</span><span class="metric-icon orange-icon">⚠</span></div><strong id="attentionCount">0</strong><small>produtos com validade ou baixo estoque</small></article>
           </div>
           <div class="content-grid overview-grid">
             <article class="card">
@@ -61,6 +61,7 @@
             </article>
             <article class="card alerts-card">
               <div class="card-heading"><div><h2>Estoque em atenção</h2><p>Validade e disponibilidade</p></div><button class="text-button" data-goto="estoque">Ver estoque <span>→</span></button></div>
+              <div class="summary-row stock-risk-summary"><span>Valor em risco de perda (lotes vencidos ou próximos)</span><strong id="stockRiskValue">R$ 0,00</strong></div>
               <div id="stockAlerts" class="alert-list"></div>
             </article>
           </div>
