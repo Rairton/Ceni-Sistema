@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#121212">
+  <meta name="description" content="Painel de gestão da Ceni Distribuidora, Tabacaria & Conveniência.">
+  <title>Ceni | Gestão da loja</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js">
+  <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js">
+  <script type="module" src="script.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#inicio" aria-label="Ceni - página inicial">
+        <img src="Assets/IMG/Logo.png" alt="Logotipo Ceni" onerror="this.hidden=true">
+        <span class="brand-copy"><strong>CENI</strong><small>Distribuidora & Lounge</small></span>
+      </a>
+      <div class="sidebar-label">MENU PRINCIPAL</div>
+      <nav class="main-nav" aria-label="Navegação principal">
+        <button class="nav-link active" data-tab="inicio"><span class="nav-icon">⌂</span>Visão geral</button>
+        <button class="nav-link" data-tab="estoque"><span class="nav-icon">▤</span>Estoque <span class="nav-count" id="stockNavCount">0</span></button>
+        <button class="nav-link" data-tab="servicos"><span class="nav-icon">♨</span>Serviços / Lounge</button>
+        <button class="nav-link" data-tab="promocoes"><span class="nav-icon">％</span>Promoções</button>
+        <button class="nav-link" data-tab="pdv"><span class="nav-icon">▣</span>Ponto de venda</button>
+        <button class="nav-link" data-tab="financeiro"><span class="nav-icon">◷</span>Financeiro</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="status-dot" id="connectionDot"></div><span id="connectionStatus">Conectando ao Firebase…</span>
+        <small>Estoque e vendas sincronizados na nuvem.</small>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <button class="menu-toggle" id="menuToggle" aria-label="Abrir menu" aria-expanded="false">☰</button>
+        <div class="breadcrumb"><span>Ceni</span><span class="crumb-slash">/</span><strong id="pageTitle">Visão geral</strong></div>
+        <div class="topbar-right"><span class="today" id="todayLabel"></span><span class="avatar">C</span></div>
+      </header>
+
+      <div class="page-wrap">
+        <section class="tab-panel active" id="tab-inicio">
+          <div class="page-heading">
+            <div><p class="eyebrow">PAINEL DE CONTROLE</p><h1>Visão geral</h1><p class="muted">Acompanhe o movimento e a operação da sua loja.</p></div>
+            <button class="button button-primary" data-goto="pdv"><span>＋</span> Nova venda</button>
+          </div>
+          <div class="metric-grid overview-metrics">
+            <article class="metric-card"><div class="metric-top"><span>Vendas de hoje</span><span class="metric-icon green-icon">↗</span></div><strong id="todayRevenue">R$ 0,00</strong><small id="todaySalesCount">0 vendas realizadas</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Vendas no mês</span><span class="metric-icon blue-icon">▣</span></div><strong id="monthRevenue">R$ 0,00</strong><small id="monthSalesCount">0 vendas realizadas</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Itens em estoque</span><span class="metric-icon purple-icon">▤</span></div><strong id="stockTotal">0</strong><small id="stockKinds">0 produtos cadastrados</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Atenção ao estoque</span><span class="metric-icon orange-icon">⚠</span></div><strong id="attentionCount">0</strong><small>produtos vencidos ou próximos</small></article>
+          </div>
+          <div class="content-grid overview-grid">
+            <article class="card">
+              <div class="card-heading"><div><h2>Vendas recentes</h2><p>Últimas movimentações registradas</p></div><button class="text-button" data-goto="financeiro">Ver histórico <span>→</span></button></div>
+              <div class="table-scroll"><table><thead><tr><th>VENDA</th><th>DATA / HORA</th><th>ITENS</th><th>PAGAMENTO</th><th class="align-right">TOTAL</th></tr></thead><tbody id="recentSalesBody"></tbody></table></div>
+            </article>
+            <article class="card alerts-card">
+              <div class="card-heading"><div><h2>Estoque em atenção</h2><p>Validade e disponibilidade</p></div><button class="text-button" data-goto="estoque">Ver estoque <span>→</span></button></div>
+              <div id="stockAlerts" class="alert-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tab-estoque">
+          <div class="page-heading"><div><p class="eyebrow">PRODUTOS</p><h1>Controle de estoque</h1><p class="muted">Cadastre produtos e acompanhe suas quantidades e validades.</p></div></div>
+          <div class="split-layout">
+            <article class="card form-card">
+              <div class="card-heading"><div><h2 id="productFormTitle">Novo produto</h2><p>Preencha os dados para controlar o estoque.</p></div></div>
+              <form id="productForm">
+                <input type="hidden" id="productId">
+                <div class="form-grid">
+                  <label>Código<input id="productCode" placeholder="Ex.: 1001"></label>
+                  <label>Nome do produto<input id="productName" required placeholder="Ex.: Cerveja lata 350ml"></label>
+                  <label>Marca<input id="productBrand" placeholder="Marca"></label>
+                  <label>Quantidade em unidades<input id="productQty" type="number" min="0" step="1" required placeholder="0"></label>
+                  <label>Custo unitário (R$)<input id="productCost" type="number" min="0" step="0.01" required placeholder="0,00"></label>
+                  <label>Margem de lucro (%)<input id="productMargin" type="number" min="0" step="0.1" value="30" required></label>
+                  <label>Validade<input id="productExpiry" type="date"></label>
+                  <label>Setor<select id="productSector" required><option value="">Selecione</option><option>Distribuidora</option><option>Tabacaria</option><option>Conveniência</option></select></label>
+                  <label class="full-field">Etiqueta<select id="productTag" required disabled><option value="">Selecione primeiro o setor</option></select></label>
+                </div>
+                <div class="form-actions"><button type="button" class="button button-quiet hidden" id="cancelProductEdit">Cancelar</button><button class="button button-primary" type="submit" id="saveProductButton">Salvar produto</button></div>
+              </form>
+            </article>
+            <article class="card stock-summary-card"><span class="summary-icon">▤</span><p>Valor investido em produtos</p><strong id="stockCostValue">R$ 0,00</strong><small>calculado pelo custo unitário × quantidade</small><hr><div class="summary-row"><span>Produtos cadastrados</span><strong id="summaryProducts">0</strong></div><div class="summary-row"><span>Unidades disponíveis</span><strong id="summaryUnits">0</strong></div></article>
+          </div>
+          <article class="card table-card">
+            <div class="card-heading wrap-heading"><div><h2>Produtos cadastrados</h2><p>Gerencie os produtos e confira alertas de validade.</p></div><div class="table-tools"><input class="search-input" id="stockSearch" type="search" placeholder="Buscar produto..."><select id="stockFilter"><option value="">Todos os setores</option><option>Distribuidora</option><option>Tabacaria</option><option>Conveniência</option></select></div></div>
+            <div class="table-scroll"><table><thead><tr><th>PRODUTO</th><th>CÓDIGO</th><th>SETOR / ETIQUETA</th><th>QTD.</th><th>CUSTO</th><th>PREÇO DE VENDA</th><th>VALIDADE</th><th></th></tr></thead><tbody id="productsBody"></tbody></table></div>
+          </article>
+        </section>
+
+        <section class="tab-panel" id="tab-servicos">
+          <div class="page-heading"><div><p class="eyebrow">LOUNGE</p><h1>Serviços</h1><p class="muted">Cadastre os serviços do lounge e venda sem movimentar estoque.</p></div></div>
+          <div class="split-layout service-layout">
+            <article class="card form-card">
+              <div class="card-heading"><div><h2 id="serviceFormTitle">Novo serviço</h2><p>O valor do serviço é lançado diretamente no caixa.</p></div></div>
+              <form id="serviceForm"><input type="hidden" id="serviceId"><div class="form-grid">
+                <label class="full-field">Nome do serviço<input id="serviceName" required placeholder="Ex.: Rosh Premium"></label>
+                <label class="full-field">Descrição<textarea id="serviceDescription" rows="3" placeholder="Detalhes do serviço"></textarea></label>
+                <label>Custo estimado (R$)<input id="serviceCost" type="number" min="0" step="0.01" value="0" required></label>
+                <label>Preço de venda (R$)<input id="servicePrice" type="number" min="0" step="0.01" required placeholder="0,00"></label>
+              </div><div class="form-actions"><button type="button" class="button button-quiet hidden" id="cancelServiceEdit">Cancelar</button><button class="button button-primary" id="saveServiceButton" type="submit">Salvar serviço</button></div></form>
+            </article>
+            <article class="card service-info"><span class="service-info-icon">♨</span><h2>Receita direta</h2><p>Serviços adicionados ao carrinho entram no faturamento e no histórico da venda, sem baixar unidades de produtos fechados.</p><div class="service-info-bottom"><span>Serviços ativos</span><strong id="serviceCount">0</strong></div></article>
+          </div>
+          <div class="service-grid" id="servicesGrid"></div>
+        </section>
+
+        <section class="tab-panel" id="tab-promocoes">
+          <div class="page-heading"><div><p class="eyebrow">OFERTAS</p><h1>Promoções</h1><p class="muted">Configure descontos automáticos por produto e quantidade mínima.</p></div></div>
+          <article class="card form-card promo-form-card">
+            <div class="card-heading"><div><h2>Nova promoção</h2><p>A promoção é aplicada automaticamente no PDV ao atingir a quantidade.</p></div></div>
+            <form id="promotionForm"><div class="form-grid promo-form-grid">
+              <label>Produto<select id="promotionProduct" required><option value="">Selecione um produto</option></select></label>
+              <label>Tipo de desconto<select id="promotionType" required><option value="percent">Percentual (%)</option><option value="fixed">Valor fixo (R$)</option></select></label>
+              <label>Valor do desconto<input id="promotionValue" type="number" min="0.01" step="0.01" required placeholder="Ex.: 10"></label>
+              <label>Quantidade mínima<input id="promotionMinQty" type="number" min="1" step="1" value="6" required></label>
+              <label class="switch-field"><span>Promoção ativa</span><input id="promotionActive" type="checkbox" checked><span class="switch"></span></label>
+              <div class="promo-submit"><button class="button button-primary" type="submit">＋ Criar promoção</button></div>
+            </div></form>
+          </article>
+          <article class="card table-card">
+            <div class="card-heading"><div><h2>Promoções cadastradas</h2><p>Ative ou pause as ofertas quando quiser.</p></div></div>
+            <div class="table-scroll"><table><thead><tr><th>PRODUTO</th><th>REGRA</th><th>QUANTIDADE MÍNIMA</th><th>DESCONTO</th><th>STATUS</th><th></th></tr></thead><tbody id="promotionsBody"></tbody></table></div>
+          </article>
+        </section>
+
+        <section class="tab-panel" id="tab-pdv">
+          <div class="page-heading"><div><p class="eyebrow">CAIXA</p><h1>Ponto de venda</h1><p class="muted">Adicione produtos e serviços ao mesmo carrinho.</p></div><span class="open-indicator"><i></i> Caixa aberto</span></div>
+          <div class="pos-layout">
+            <article class="card pos-products">
+              <div class="card-heading"><div><h2>Adicionar ao carrinho</h2><p>Escolha produtos do estoque ou serviços do lounge.</p></div></div>
+              <div class="pos-search"><input type="search" id="posSearch" placeholder="Buscar produto ou serviço..."></div>
+              <div class="pos-catalog">
+                <div class="catalog-section"><h3>PRODUTOS <span id="posProductCount">0</span></h3><div class="catalog-list" id="posProducts"></div></div>
+                <div class="catalog-section"><h3>SERVIÇOS <span id="posServiceCount">0</span></h3><div class="catalog-list" id="posServices"></div></div>
+              </div>
+            </article>
+            <article class="card cart-card">
+              <div class="card-heading"><div><h2>Carrinho <span class="cart-count" id="cartCount">0</span></h2><p id="cartDate"></p></div><button type="button" class="text-button danger-text" id="clearCart">Limpar</button></div>
+              <div class="cart-lines" id="cartLines"></div>
+              <div class="cart-calculation">
+                <div class="attendant-controls">
+                  <label class="payment-label" for="attendantSelect">Atendente<select id="attendantSelect" required><option value="">Carregando atendentes…</option></select></label>
+                  <div class="attendant-editor">
+                    <input id="attendantNewName" type="text" maxlength="40" placeholder="Nome do atendente">
+                    <button type="button" class="button button-quiet" id="addAttendant">Adicionar</button>
+                    <button type="button" class="button button-quiet" id="renameAttendant">Renomear</button>
+                    <button type="button" class="button button-quiet attendant-remove" id="removeAttendant" title="Remover atendente selecionado" aria-label="Remover atendente selecionado">×</button>
+                  </div>
+                </div>
+                <div class="calculation-row"><span>Subtotal</span><strong id="cartSubtotal">R$ 0,00</strong></div>
+                <div class="calculation-row promo-saving hidden" id="promoSavingRow"><span>Descontos de promoção</span><strong id="promoSaving">− R$ 0,00</strong></div>
+                <div class="manual-discount-fields"><label>Desconto manual / cortesia (R$)<input id="manualDiscount" type="number" min="0" step="0.01" value="0"></label><label>Justificativa do desconto<input id="discountReason" placeholder="Obrigatória quando houver desconto" disabled></label></div>
+                <div class="calculation-row total-row"><span>Total a pagar</span><strong id="cartTotal">R$ 0,00</strong></div>
+                <label class="payment-label">Forma de pagamento<select id="paymentMethod"><option>Pix</option><option>Dinheiro</option><option>Cartão de débito</option><option>Cartão de crédito</option><option>Outro</option></select></label>
+                <button class="button button-primary finish-sale" id="finishSale" type="button">Finalizar venda <span>→</span></button>
+                <p class="secure-note">✓ Venda registrada no histórico e no caixa</p>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tab-financeiro">
+          <div class="page-heading"><div><p class="eyebrow">CONTROLE FINANCEIRO</p><h1>Financeiro</h1><p class="muted">Visão do mês atual • <span id="financeMonth"></span></p></div></div>
+          <div class="metric-grid finance-metrics">
+            <article class="metric-card"><div class="metric-top"><span>Faturamento bruto</span><span class="metric-icon green-icon">↗</span></div><strong id="financeGross">R$ 0,00</strong><small>vendas e serviços no mês</small></article>
+            <article class="metric-card"><div class="metric-top"><span>CMV</span><span class="metric-icon blue-icon">▤</span></div><strong id="financeCmv">R$ 0,00</strong><small>custo dos produtos vendidos</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Despesas</span><span class="metric-icon orange-icon">↘</span></div><strong id="financeExpenses">R$ 0,00</strong><small>fixas e imprevistos no mês</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Descontos concedidos</span><span class="metric-icon purple-icon">％</span></div><strong id="financeDiscounts">R$ 0,00</strong><small>promoções e descontos manuais</small></article>
+            <article class="metric-card profit-card"><div class="metric-top"><span>Lucro líquido real</span><span class="metric-icon green-icon">✦</span></div><strong id="financeProfit">R$ 0,00</strong><small>faturamento − CMV − despesas</small></article>
+          </div>
+          <div class="finance-layout">
+            <article class="card form-card expense-card">
+              <div class="card-heading"><div><h2>Lançar despesa</h2><p>Registre custos fixos ou imprevistos.</p></div></div>
+              <form id="expenseForm"><div class="form-grid">
+                <label>Descrição<input id="expenseDescription" required placeholder="Ex.: Conta de luz"></label>
+                <label>Categoria<select id="expenseCategory" required><option value="Fixa">Despesa fixa</option><option value="Imprevisto">Imprevisto / avaria / manutenção</option></select></label>
+                <label>Valor (R$)<input id="expenseAmount" type="number" min="0.01" step="0.01" required placeholder="0,00"></label>
+                <label>Data<input id="expenseDate" type="date" required></label>
+              </div><div class="expense-quick"><span>Sugestões:</span><button type="button" data-expense="Aluguel">Aluguel</button><button type="button" data-expense="Água">Água</button><button type="button" data-expense="Luz">Luz</button><button type="button" data-expense="Internet">Internet</button></div>
+              <div class="form-actions"><button class="button button-primary" type="submit">＋ Registrar despesa</button></div></form>
+            </article>
+            <article class="card expense-list-card"><div class="card-heading"><div><h2>Despesas do mês</h2><p>Últimos lançamentos</p></div></div><div id="expensesList" class="expense-list"></div></article>
+          </div>
+          <article class="card table-card history-card">
+            <div class="card-heading wrap-heading"><div><h2>Histórico de vendas</h2><p>Vendas e serviços finalizados no caixa.</p></div><div class="table-tools"><input class="search-input" id="historySearch" type="search" placeholder="Buscar na venda..."></div></div>
+            <div class="table-scroll"><table><thead><tr><th>VENDA</th><th>DATA / HORA</th><th>ITENS / SERVIÇOS</th><th>PAGAMENTO</th><th>DESCONTOS</th><th class="align-right">TOTAL</th></tr></thead><tbody id="salesHistoryBody"></tbody></table></div>
+          </article>
+        </section>
+      </div>
+    </main>
+  </div>
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <div class="modal-backdrop hidden" id="saleModal" role="dialog" aria-modal="true" aria-labelledby="saleModalTitle">
+    <div class="modal-card"><div class="success-mark">✓</div><p class="eyebrow">VENDA CONCLUÍDA</p><h2 id="saleModalTitle">Venda registrada!</h2><p id="saleModalMessage"></p><button class="button button-primary" id="closeSaleModal">Continuar</button></div>
+  </div>
+</body>
+</html>
